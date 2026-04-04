@@ -1,0 +1,379 @@
+"""
+valuation.py — FairValueModel: the main inference class.
+
+Usage:
+    from src.valuation import FairValueModel
+
+    fvm = FairValueModel.load()   # loads model + data from default paths
+    result = fvm.estimate(spec)   # spec is a dict of property attributes
+    print(result["psf_estimate"], result["price_estimate"])
+    print(result["comps"])        # DataFrame of comparable transactions
+"""
+
+import os
+import numpy as np
+import pandas as pd
+from datetime import date
+
+from src import features as F
+from src import model as M
+
+# ── Spec keys (what the user provides) ───────────────────────────────────────
+# Minimum required: property_type, postal_district, area_sqft, tenure_raw
+# Optional:         floor_midpoint, date_of_sale (defaults to today)
+
+SPEC_DEFAULTS = {
+    "property_type":    "condo",
+    "postal_district":  10,
+    "market_segment":   None,       # auto-derived from district if None
+    "tenure_raw":       "Freehold",
+    "area_sqft":        1000.0,
+    "floor_midpoint":   None,       # will impute from district median
+    "floor_range":      None,
+    "project_name":     None,
+    "lat":              None,
+    "lng":              None,
+    "date_of_sale":     None,       # defaults to today
+    "type_of_sale":     "Resale",
+}
+
+# ── District → approximate lat/lng centroid (for distance features) ───────────
+_DISTRICT_CENTROIDS = {
+    1:  (1.2834, 103.8507), 2:  (1.2792, 103.8442), 3:  (1.2885, 103.8196),
+    4:  (1.2637, 103.8207), 5:  (1.3063, 103.7800), 6:  (1.2897, 103.8500),
+    7:  (1.3010, 103.8561), 8:  (1.3106, 103.8594), 9:  (1.3028, 103.8337),
+    10: (1.3085, 103.8031), 11: (1.3189, 103.8360), 12: (1.3286, 103.8629),
+    13: (1.3230, 103.8833), 14: (1.3150, 103.8888), 15: (1.3059, 103.9097),
+    16: (1.3246, 103.9411), 17: (1.3735, 103.9505), 18: (1.3518, 103.9420),
+    19: (1.3643, 103.8794), 20: (1.3568, 103.8166), 21: (1.3302, 103.7764),
+    22: (1.3393, 103.7050), 23: (1.3795, 103.7491), 24: (1.3973, 103.7413),
+    25: (1.4201, 103.8084), 26: (1.3942, 103.8470), 27: (1.4042, 103.7985),
+    28: (1.3701, 103.8457),
+}
+
+_DISTRICT_SEGMENT_MAP = {
+    1: "CCR", 2: "CCR", 3: "CCR", 4: "CCR", 6: "CCR",
+    9: "CCR", 10: "CCR", 11: "CCR",
+    5: "RCR", 7: "RCR", 8: "RCR", 12: "RCR", 13: "RCR",
+    14: "RCR", 15: "RCR", 20: "RCR",
+}
+
+_DISTRICT_TIER_MAP = {
+    9: 1, 10: 1, 11: 1, 1: 2, 2: 2, 3: 2, 4: 2, 6: 2,
+    5: 3, 7: 3, 8: 3, 12: 3, 13: 3, 14: 3, 15: 3, 20: 3,
+}
+
+
+def _spec_to_row(spec: dict) -> pd.DataFrame:
+    """Convert a property spec dict into a single-row DataFrame."""
+    s = {**SPEC_DEFAULTS, **spec}
+
+    # Date default
+    if s["date_of_sale"] is None:
+        s["date_of_sale"] = pd.Timestamp(date.today())
+    else:
+        s["date_of_sale"] = pd.Timestamp(s["date_of_sale"])
+
+    # Market segment
+    district = int(s["postal_district"])
+    if s["market_segment"] is None:
+        s["market_segment"] = _DISTRICT_SEGMENT_MAP.get(district, "OCR")
+
+    seg_map = {"CCR": 0, "RCR": 1, "OCR": 2}
+    s["market_segment_code"] = seg_map.get(s["market_segment"], 2)
+    s["district_tier"] = _DISTRICT_TIER_MAP.get(district, 4)
+
+    # Tenure
+    from src.pipeline import parse_tenure
+    tenure_type, lease_years, tenure_start_year = parse_tenure(s["tenure_raw"])
+    s["tenure_type"]        = tenure_type
+    s["lease_years"]        = lease_years
+    s["tenure_start_year"]  = tenure_start_year
+    s["is_freehold"]        = 1 if tenure_type == "freehold" else 0
+
+    # Floor
+    if s["floor_range"] and s["floor_midpoint"] is None:
+        from src.pipeline import parse_floor_range
+        s["floor_midpoint"], s["floor_band"] = parse_floor_range(s["floor_range"])
+    if s["floor_midpoint"] is None:
+        s["floor_midpoint"] = 10.0
+    if "floor_band" not in s or s["floor_band"] is None:
+        fm = float(s["floor_midpoint"])
+        s["floor_band"] = (
+            "low" if fm <= 5 else "mid" if fm <= 15 else
+            "high" if fm <= 30 else "penthouse"
+        )
+
+    # Location: lat/lng from district centroid if not provided
+    if s["lat"] is None or s["lng"] is None:
+        s["lat"], s["lng"] = _DISTRICT_CENTROIDS.get(district, (1.35, 103.82))
+
+    row = pd.DataFrame([s])
+    return row
+
+
+def _build_spec_features(row: pd.DataFrame, df_history: pd.DataFrame) -> pd.DataFrame:
+    """Engineer features for a single spec row, using history for context."""
+    # Time features
+    row = F.add_time_features(row)
+
+    # Distance features (lat/lng available)
+    row = F.add_distance_features(row)
+
+    # Property features
+    row["log_area"] = np.log1p(row["area_sqft"])
+    row["floor_midpoint_sq"] = row["floor_midpoint"] ** 2
+
+    # Age at sale
+    if "tenure_start_year" in row.columns and row["tenure_start_year"].notna().any():
+        row["age_at_sale"] = row["year"] - row["tenure_start_year"].fillna(row["year"] - 10)
+        row["age_at_sale"] = row["age_at_sale"].clip(0, 80)
+    else:
+        row["age_at_sale"] = 10.0
+
+    # Remaining lease
+    if "remaining_lease" not in row.columns or row["remaining_lease"].isna().all():
+        if row["is_freehold"].iloc[0]:
+            row["remaining_lease"] = 99.0
+        elif row.get("lease_years") is not None:
+            row["remaining_lease"] = 99.0
+        else:
+            row["remaining_lease"] = 60.0
+
+    # Sale type
+    ts_map = {"new sale": 0, "sub sale": 1, "resale": 2}
+    row["sale_type_code"] = row["type_of_sale"].str.strip().str.lower().map(ts_map).fillna(2)
+
+    # Type dummies
+    type_dummies = pd.get_dummies(row["property_type"], prefix="type")
+    row = pd.concat([row, type_dummies], axis=1)
+
+    # Band dummies
+    band_dummies = pd.get_dummies(row["floor_band"], prefix="band")
+    row = pd.concat([row, band_dummies], axis=1)
+
+    # Rolling features from history
+    district = int(row["postal_district"].iloc[0])
+    sale_date = row["date_of_sale"].iloc[0]
+
+    # Monthly district PSF (trailing 3 months)
+    history_window = df_history[
+        (df_history["postal_district"] == district) &
+        (df_history["date_of_sale"] <= sale_date) &
+        (df_history["date_of_sale"] >= sale_date - pd.DateOffset(months=3))
+    ]
+    row["monthly_district_psf"] = (
+        history_window["psf"].median() if len(history_window) > 0
+        else df_history[df_history["postal_district"] == district]["psf"].median()
+    )
+
+    # Project rolling PSF
+    proj = str(row["project_name"].iloc[0]).upper() if row["project_name"].iloc[0] else None
+    if proj:
+        proj_history = df_history[df_history["project_name"] == proj]
+        row["project_rolling_psf"] = (
+            proj_history["psf"].median() if len(proj_history) > 0
+            else row["monthly_district_psf"].iloc[0]
+        )
+        row["txn_count_project_6m"] = len(proj_history)
+    else:
+        row["project_rolling_psf"] = row["monthly_district_psf"]
+        row["txn_count_project_6m"] = 0
+
+    # Project mean PSF (target encoding)
+    if proj:
+        proj_mean = df_history[df_history["project_name"] == proj]["psf"].mean()
+        row["project_mean_psf"] = proj_mean if not np.isnan(proj_mean) else row["monthly_district_psf"].iloc[0]
+    else:
+        row["project_mean_psf"] = row["monthly_district_psf"]
+
+    return row
+
+
+# ── Comparable selection ──────────────────────────────────────────────────────
+
+def get_comps(
+    spec: dict,
+    df_history: pd.DataFrame,
+    n: int = 10,
+    lookback_months: int = 18,
+) -> pd.DataFrame:
+    """
+    Find comparable transactions for a given spec.
+    Scoring: property_type match, district match, area within ±30%, floor band match,
+    tenure match, date recency.
+    """
+    s = {**SPEC_DEFAULTS, **spec}
+    sale_date = pd.Timestamp(s["date_of_sale"] or date.today())
+    cutoff = sale_date - pd.DateOffset(months=lookback_months)
+
+    cands = df_history[df_history["date_of_sale"] >= cutoff].copy()
+    if len(cands) == 0:
+        cands = df_history.copy()
+
+    cands["_score"] = 0
+
+    # Type match (weight 3)
+    cands["_score"] += (cands["property_type"] == s["property_type"]).astype(int) * 3
+
+    # Same district (weight 4) vs adjacent CCR/RCR/OCR tier (weight 2)
+    cands["_score"] += (cands["postal_district"] == int(s["postal_district"])).astype(int) * 4
+
+    # Area similarity: within ±20% = 3 pts, ±30% = 1 pt
+    area = float(s["area_sqft"])
+    area_ratio = (cands["area_sqft"] - area).abs() / area
+    cands["_score"] += (area_ratio < 0.20).astype(int) * 3
+    cands["_score"] += (area_ratio < 0.30).astype(int) * 1
+
+    # Tenure match (weight 2)
+    tenure_type, _, _ = __import__("src.pipeline", fromlist=["parse_tenure"]).parse_tenure(s["tenure_raw"])
+    if "tenure_type" in cands.columns:
+        cands["_score"] += (cands["tenure_type"] == tenure_type).astype(int) * 2
+
+    # Floor band match (weight 1)
+    if "floor_band" in cands.columns and s.get("floor_band"):
+        cands["_score"] += (cands["floor_band"] == s.get("floor_band")).astype(int) * 1
+
+    # Recency bonus (weight 1 per quarter in last year)
+    months_ago = (sale_date - cands["date_of_sale"]).dt.days / 30
+    cands["_score"] += (months_ago <= 3).astype(int) * 2
+    cands["_score"] += (months_ago <= 6).astype(int) * 1
+
+    # Sort and take top n
+    comps = (
+        cands.sort_values("_score", ascending=False)
+        .head(n * 3)  # oversample then filter
+        .nlargest(n, "_score")
+        [["project_name", "property_type", "postal_district",
+          "area_sqft", "psf", "price", "floor_range", "tenure_raw",
+          "date_of_sale", "type_of_sale"]]
+        .copy()
+    )
+    comps["date_of_sale"] = comps["date_of_sale"].dt.strftime("%b %Y")
+    comps = comps.rename(columns={
+        "project_name":   "Project",
+        "property_type":  "Type",
+        "postal_district": "D",
+        "area_sqft":      "Area (sqft)",
+        "psf":            "PSF ($)",
+        "price":          "Price ($)",
+        "floor_range":    "Floor",
+        "tenure_raw":     "Tenure",
+        "date_of_sale":   "Date",
+        "type_of_sale":   "Sale Type",
+    })
+    comps["PSF ($)"] = comps["PSF ($)"].round(0).astype(int)
+    comps["Price ($)"] = comps["Price ($)"].fillna(0).astype(int)
+    return comps.reset_index(drop=True)
+
+
+# ── Main FairValueModel class ─────────────────────────────────────────────────
+
+class FairValueModel:
+    """
+    Wrapper combining the trained LightGBM model with the transaction history
+    for comparable lookup and context features.
+    """
+
+    def __init__(self, model_artifacts: dict, df_history: pd.DataFrame):
+        self.model           = model_artifacts["model"]
+        self.feature_cols    = model_artifacts["feature_cols"]
+        self.metadata        = model_artifacts["metadata"]
+        self.quantile_models = model_artifacts.get("quantile_models")
+        self.df_history      = df_history
+
+    @classmethod
+    def load(
+        cls,
+        model_dir:    str = "models",
+        history_path: str = "data/processed/transactions.parquet",
+    ) -> "FairValueModel":
+        artifacts = M.load(model_dir)
+        df = pd.read_parquet(history_path)
+        return cls(artifacts, df)
+
+    def estimate(self, spec: dict) -> dict:
+        """
+        Estimate fair value for a property spec.
+
+        Returns dict:
+          psf_estimate     : float — point estimate PSF
+          price_estimate   : float — point estimate total price
+          ci_low_psf       : float — 80% CI lower bound PSF
+          ci_high_psf      : float — 80% CI upper bound PSF
+          ci_low_price     : float
+          ci_high_price    : float
+          comps            : pd.DataFrame — comparable transactions
+          shap_values      : pd.DataFrame or None
+          district_median_psf : float
+          pct_vs_district  : float — estimate vs district median (%)
+        """
+        s = {**SPEC_DEFAULTS, **spec}
+        area = float(s["area_sqft"])
+
+        # Build feature row
+        row = _spec_to_row(s)
+        row = _build_spec_features(row, self.df_history)
+
+        # Align to training feature columns
+        X = pd.DataFrame(columns=self.feature_cols)
+        X = pd.concat([X, row], ignore_index=True)
+        X = X[self.feature_cols].fillna(0).astype(float)
+
+        # Point estimate
+        log_psf = self.model.predict(X)[0]
+        psf_est = float(np.exp(log_psf))
+
+        # Confidence interval via quantile models
+        ci_low_psf = ci_high_psf = None
+        if self.quantile_models:
+            try:
+                ci_low_psf  = float(np.exp(self.quantile_models[0.10].predict(X)[0]))
+                ci_high_psf = float(np.exp(self.quantile_models[0.90].predict(X)[0]))
+            except Exception:
+                pass
+        if ci_low_psf is None:
+            # Fallback: ±15% heuristic (typical MAPE for this type of model)
+            ci_low_psf  = psf_est * 0.85
+            ci_high_psf = psf_est * 1.15
+
+        # District context
+        district = int(s["postal_district"])
+        d_median = self.df_history[
+            self.df_history["postal_district"] == district
+        ]["psf"].median()
+        pct_vs_district = (psf_est / d_median - 1) * 100 if d_median else 0.0
+
+        # SHAP (single row)
+        shap_row = None
+        try:
+            shap_df = M.explain(self.model, X)
+            shap_row = shap_df.iloc[0].sort_values(key=abs, ascending=False)
+        except Exception:
+            pass
+
+        # Comparables
+        comps = get_comps(s, self.df_history, n=10)
+
+        return {
+            "psf_estimate":       round(psf_est),
+            "price_estimate":     round(psf_est * area),
+            "ci_low_psf":         round(ci_low_psf),
+            "ci_high_psf":        round(ci_high_psf),
+            "ci_low_price":       round(ci_low_psf * area),
+            "ci_high_price":      round(ci_high_psf * area),
+            "district_median_psf": round(d_median) if d_median else None,
+            "pct_vs_district":    round(pct_vs_district, 1),
+            "comps":              comps,
+            "shap_values":        shap_row,
+        }
+
+    def model_info(self) -> dict:
+        return {
+            **self.metadata,
+            "feature_count":   len(self.feature_cols),
+            "history_rows":    len(self.df_history),
+            "history_from":    str(self.df_history["date_of_sale"].min().date()),
+            "history_to":      str(self.df_history["date_of_sale"].max().date()),
+            "projects":        int(self.df_history["project_name"].nunique()),
+        }

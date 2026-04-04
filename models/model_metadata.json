@@ -1,0 +1,1 @@
+{"trained_at": "2026-04-04T13:27:32.565669", "n_train": 121220, "n_holdout": 14346, "holdout_mae": 107.7, "holdout_rmse": 172.4, "holdout_mape": 5.38, "holdout_within_10pct": 88.2, "holdout_within_20pct": 97.1, "holdout_n": 14346}

@@ -1,0 +1,23 @@
+# Secrets
+.env
+
+# Raw data (large, not for version control)
+data/raw/
+data/external/geocode_cache.json
+data/external/ura_token.json
+data/debug_pg.html
+
+# Processed data and model ARE committed so the app works on deployment
+# data/processed/
+# models/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# Streamlit
+.streamlit/secrets.toml

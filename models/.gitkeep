@@ -1,0 +1,4 @@
+# Trained model artifacts saved here by train.py
+# - lgbm_psf_model.joblib
+# - feature_columns.json
+# - model_metadata.json
