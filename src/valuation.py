@@ -201,6 +201,60 @@ def _build_spec_features(row: pd.DataFrame, df_history: pd.DataFrame) -> pd.Data
 
 # ── Comparable selection ──────────────────────────────────────────────────────
 
+def get_project_history(
+    spec: dict,
+    df_history: pd.DataFrame,
+    n: int = 15,
+) -> pd.DataFrame:
+    """
+    Return recent transactions for the same project, sorted newest first.
+    Falls back to same-street transactions if project has < 3 records.
+    Returns empty DataFrame if no project name given.
+    """
+    s = {**SPEC_DEFAULTS, **spec}
+    proj = str(s.get("project_name") or "").strip().upper()
+    if not proj:
+        return pd.DataFrame()
+
+    rows = df_history[df_history["project_name"].str.upper() == proj].copy()
+
+    # Fallback: same street if project has very few records
+    if len(rows) < 3 and "street_name" in df_history.columns:
+        street = df_history.loc[
+            df_history["project_name"].str.upper() == proj, "street_name"
+        ].iloc[0] if len(rows) > 0 else None
+        if street:
+            rows = df_history[
+                df_history["street_name"].str.upper() == str(street).strip().upper()
+            ].copy()
+
+    if len(rows) == 0:
+        return pd.DataFrame()
+
+    rows = rows.sort_values("date_of_sale", ascending=False).head(n)
+
+    output_cols = ["property_type", "area_sqft", "floor_range",
+                   "psf", "price", "tenure_raw", "date_of_sale", "type_of_sale"]
+    available = [c for c in output_cols if c in rows.columns]
+    rows = rows[available].copy()
+    rows["date_of_sale"] = rows["date_of_sale"].dt.strftime("%b %Y")
+    rows = rows.rename(columns={
+        "property_type":  "Type",
+        "area_sqft":      "Area (sqft)",
+        "floor_range":    "Floor",
+        "psf":            "PSF ($)",
+        "price":          "Price ($)",
+        "tenure_raw":     "Tenure",
+        "date_of_sale":   "Date",
+        "type_of_sale":   "Sale Type",
+    })
+    if "PSF ($)" in rows.columns:
+        rows["PSF ($)"] = rows["PSF ($)"].round(0).astype(int)
+    if "Price ($)" in rows.columns:
+        rows["Price ($)"] = rows["Price ($)"].fillna(0).astype(int)
+    return rows.reset_index(drop=True)
+
+
 def get_comps(
     spec: dict,
     df_history: pd.DataFrame,
@@ -231,12 +285,12 @@ def get_comps(
     if len(cands) == 0:
         cands = df_history.copy()
 
-    cands["_score"] = 0.0
-
-    # ── Same project ──────────────────────────────────────────────────────────
+    # Exclude same project — it gets its own table via get_project_history
     proj = str(s.get("project_name") or "").strip().upper()
     if proj:
-        cands["_score"] += (cands["project_name"].str.upper() == proj).astype(float) * 6
+        cands = cands[cands["project_name"].str.upper() != proj]
+
+    cands["_score"] = 0.0
 
     # ── Location proximity ────────────────────────────────────────────────────
     # Prefer SVY21 Euclidean distance (URA API rows); fall back to district match
@@ -427,7 +481,8 @@ class FairValueModel:
             pass
 
         # Comparables
-        comps = get_comps(s, self.df_history, n=10)
+        project_hist = get_project_history(s, self.df_history, n=15)
+        comps        = get_comps(s, self.df_history, n=10)
 
         return {
             "psf_estimate":       round(psf_est),
@@ -438,6 +493,7 @@ class FairValueModel:
             "ci_high_price":      round(ci_high_psf * area),
             "district_median_psf": round(d_median) if d_median else None,
             "pct_vs_district":    round(pct_vs_district, 1),
+            "project_history":    project_hist,
             "comps":              comps,
             "shap_values":        shap_row,
         }

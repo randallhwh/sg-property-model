@@ -648,9 +648,24 @@ with tab_estimate:
                     st.markdown("<br>**Value drivers (SHAP)**", unsafe_allow_html=True)
                     _render_shap(res["shap_values"])
 
-                # ── Comparables ───────────────────────────────────────────────
-                st.markdown("<br>**Comparable transactions**", unsafe_allow_html=True)
+                # ── Project history ───────────────────────────────────────────
+                proj_hist = res.get("project_history", pd.DataFrame())
+                if len(proj_hist) > 0:
+                    _proj_label = (project_name.strip().upper() or "Project").title()
+                    st.markdown(
+                        f"<br>**{_proj_label} — recent transactions**",
+                        unsafe_allow_html=True,
+                    )
+                    _render_comps(proj_hist)
+
+                # ── Nearby / model-relevant comps ─────────────────────────────
                 comps = res["comps"]
+                _comps_label = (
+                    "<br>**Nearby comparable transactions**"
+                    if len(proj_hist) > 0
+                    else "<br>**Comparable transactions**"
+                )
+                st.markdown(_comps_label, unsafe_allow_html=True)
                 if len(comps) > 0:
                     _render_comps(comps)
                 else:
@@ -663,19 +678,24 @@ with tab_estimate:
                     Model not trained yet — showing comparable transactions only.
                 </div>
                 """, unsafe_allow_html=True)
-                from src.valuation import get_comps, SPEC_DEFAULTS
+                from src.valuation import get_comps, get_project_history, SPEC_DEFAULTS
+                proj_hist = get_project_history(spec, df_hist, n=15)
                 comps = get_comps(spec, df_hist, n=15)
+                if len(proj_hist) > 0:
+                    _proj_label = (project_name.strip().upper() or "Project").title()
+                    st.markdown(f"**{_proj_label} — recent transactions**")
+                    _render_comps(proj_hist)
                 if len(comps) > 0:
-                    st.markdown("**Comparable transactions (trailing 18 months)**")
+                    st.markdown("**Nearby comparable transactions**")
                     _render_comps(comps)
                     med_psf = comps["PSF ($)"].median()
                     st.markdown(f"""
                     <div class="info-box">
-                        Comps median PSF: <b style="color:#60a5fa">{fmt_psf(med_psf)}</b>
+                        Nearby comps median PSF: <b style="color:#60a5fa">{fmt_psf(med_psf)}</b>
                         &nbsp;·&nbsp; Implied price: <b style="color:#fbbf24">{fmt_sgd(med_psf * area_sqft)}</b>
                     </div>
                     """, unsafe_allow_html=True)
-                else:
+                elif len(proj_hist) == 0:
                     st.warning("No comparable transactions found.")
 
 # ══════════════════════════════════════════════════════════════════════════════
