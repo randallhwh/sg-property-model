@@ -428,7 +428,23 @@ with tab_estimate:
                 st.success(f"Loaded: **{st.session_state['pg_project']}**{_price_str} — check fields below.")
                 st.rerun()
             except Exception as e:
-                st.warning(f"Could not fetch listing: {e}")
+                # 403 = PropertyGuru blocks cloud server IPs (works fine locally)
+                _is_403 = "403" in str(e)
+                from src.propertyguru import _project_from_url
+                _proj_guess = _project_from_url(pg_url)
+                if _proj_guess and st.session_state["pg_project"] != _proj_guess:
+                    st.session_state["pg_project"]    = _proj_guess
+                    st.session_state["pg_loaded_url"] = pg_url
+                if _is_403:
+                    st.warning(
+                        f"**PropertyGuru blocked the request (403)** — this is common when running "
+                        f"on Streamlit Cloud as the server IP is flagged.\n\n"
+                        f"Project name pre-filled as **{_proj_guess}** from the URL. "
+                        f"Please fill in the remaining fields (district, area, floor, tenure, price) manually."
+                    )
+                    st.rerun()
+                else:
+                    st.warning(f"Could not fetch listing: {e}")
 
     if st.session_state.get("pg_raw") and st.session_state.get("pg_loaded_url") == pg_url:
         with st.expander("🔍 Scraper debug — what was extracted", expanded=False):

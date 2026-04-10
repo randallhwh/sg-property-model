@@ -140,6 +140,60 @@ def _parse_area(raw, unit: str = "sqft") -> float | None:
     return val
 
 
+# ── URL-only fallback ─────────────────────────────────────────────────────────
+
+def _project_from_url(url: str) -> str:
+    """Extract a best-guess project name from the listing URL slug."""
+    slug = url.rstrip("/").split("/")[-1]
+    slug = re.sub(r"-?\d{6,}$", "", slug)
+    slug = re.sub(r"^(for-sale|for-rent|for-lease)-?", "", slug, flags=re.IGNORECASE)
+    return slug.replace("-", " ").title().strip()
+
+
+def _fetch_html(url: str) -> str:
+    """
+    Try multiple strategies to fetch PropertyGuru HTML.
+    Strategy 1: cloudscraper (works on residential IPs / locally)
+    Strategy 2: httpx with HTTP/2 (sometimes bypasses cloud IP blocks)
+    Raises requests.HTTPError on final failure.
+    """
+    # Strategy 1: cloudscraper
+    try:
+        scraper = cloudscraper.create_scraper(browser={"browser": "chrome", "platform": "windows"})
+        resp = scraper.get(url, headers=_HEADERS, timeout=20)
+        if resp.status_code == 200:
+            return resp.text
+        first_status = resp.status_code
+    except Exception as e:
+        first_status = str(e)
+
+    # Strategy 2: httpx with HTTP/2
+    try:
+        import httpx
+        _h2_headers = {
+            **_HEADERS,
+            "Accept-Encoding": "gzip, deflate, br",
+            "Sec-Fetch-Dest":  "document",
+            "Sec-Fetch-Mode":  "navigate",
+            "Sec-Fetch-Site":  "none",
+            "Sec-Fetch-User":  "?1",
+            "Upgrade-Insecure-Requests": "1",
+        }
+        with httpx.Client(http2=True, follow_redirects=True, timeout=20) as client:
+            r = client.get(url, headers=_h2_headers)
+            if r.status_code == 200:
+                return r.text
+    except Exception:
+        pass
+
+    # Both failed — raise with the original status so callers can handle it
+    import requests
+    raise requests.HTTPError(
+        f"{first_status} for url: {url}",
+        response=type("R", (), {"status_code": first_status if isinstance(first_status, int) else 403})(),
+    )
+
+
 # ── Main scraper ──────────────────────────────────────────────────────────────
 
 def scrape(url: str) -> dict:
@@ -147,10 +201,8 @@ def scrape(url: str) -> dict:
     Scrape a PropertyGuru listing and return a spec dict.
     Raises on HTTP error or if the page can't be parsed at all.
     """
-    scraper = cloudscraper.create_scraper(browser={"browser": "chrome", "platform": "windows"})
-    resp = scraper.get(url, headers=_HEADERS, timeout=20)
-    resp.raise_for_status()
-    soup = BeautifulSoup(resp.text, "html.parser")
+    html = _fetch_html(url)
+    soup = BeautifulSoup(html, "html.parser")
 
     result = {
         "prop_type":     "condo",

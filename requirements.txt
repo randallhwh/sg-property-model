@@ -8,5 +8,6 @@ shap>=0.44
 requests>=2.31
 beautifulsoup4>=4.12
 cloudscraper>=1.2
+httpx[http2]>=0.27
 python-dateutil>=2.8
 joblib>=1.3
