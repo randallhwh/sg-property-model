@@ -255,25 +255,48 @@ def get_project_history(
     return rows.reset_index(drop=True)
 
 
+def _resolve_spec_coords(spec: dict, df_history: pd.DataFrame) -> tuple[float, float]:
+    """
+    Return best (x_svy21, y_svy21) for a spec, in priority order:
+      1. Project name  → median SVY21 of that project's transactions in history
+      2. Spec x/y      → already provided
+      3. District centroid (rough fallback only)
+    """
+    proj = str(spec.get("project_name") or "").strip().upper()
+    if proj and "x_svy21" in df_history.columns:
+        proj_rows = df_history[df_history["project_name"].str.upper() == proj]
+        px = pd.to_numeric(proj_rows["x_svy21"], errors="coerce").dropna()
+        py = pd.to_numeric(proj_rows["y_svy21"], errors="coerce").dropna()
+        if len(px) > 0 and len(py) > 0:
+            return float(px.median()), float(py.median())
+
+    if spec.get("x_svy21") and spec.get("y_svy21"):
+        return float(spec["x_svy21"]), float(spec["y_svy21"])
+
+    # Reverse lat/lng to SVY21 if available
+    if spec.get("lat") and spec.get("lng"):
+        lat, lng = float(spec["lat"]), float(spec["lng"])
+        return (lng - 103.8333333) * 111279.0 + 28001.642, (lat - 1.3666667) * 110574.0 + 38744.572
+
+    # Last resort: district centroid
+    dist = int(spec.get("postal_district", 10))
+    c = _DISTRICT_CENTROIDS.get(dist, (1.35, 103.82))
+    return (c[1] - 103.8333333) * 111279.0 + 28001.642, (c[0] - 1.3666667) * 110574.0 + 38744.572
+
+
 def get_comps(
     spec: dict,
     df_history: pd.DataFrame,
     n: int = 10,
-    lookback_months: int = 24,
+    lookback_months: int = 36,
 ) -> pd.DataFrame:
     """
-    Find the best comparable transactions using a nearest-neighbour scoring system.
+    Find nearby comparable transactions from other projects.
 
-    Scoring weights:
-      - Same project           : 6 pts
-      - Location proximity     : up to 5 pts  (SVY21 metres if available, else district)
-      - Type match             : 3 pts
-      - Same district          : 4 pts (only when location score < 5)
-      - Area ±20%              : 3 pts  / ±30% : 1 pt
-      - PSF within ±15%        : 3 pts  / ±25% : 1 pt
-      - Tenure match           : 2 pts
-      - Floor band match       : 1 pt
-      - Recency (≤3 months)    : 2 pts  / ≤6m : 1 pt
+    Location strategy (hard filter, not just scoring):
+      - Resolve reference point from project coords in history (most precise)
+      - Filter to transactions within 1 km; expand to 2 km / 3 km if < n*2 results
+      - Final ranking by: type match, area similarity, tenure, recency, PSF proximity
     """
     from src.pipeline import parse_tenure as _parse_tenure
 
@@ -281,99 +304,96 @@ def get_comps(
     sale_date = pd.Timestamp(s["date_of_sale"] or date.today())
     cutoff = sale_date - pd.DateOffset(months=lookback_months)
 
-    cands = df_history[df_history["date_of_sale"] >= cutoff].copy()
-    if len(cands) == 0:
-        cands = df_history.copy()
+    all_cands = df_history[df_history["date_of_sale"] >= cutoff].copy()
+    if len(all_cands) == 0:
+        all_cands = df_history.copy()
 
-    # Exclude same project — it gets its own table via get_project_history
+    # Exclude same project — it gets its own table
     proj = str(s.get("project_name") or "").strip().upper()
     if proj:
-        cands = cands[cands["project_name"].str.upper() != proj]
+        all_cands = all_cands[all_cands["project_name"].str.upper() != proj]
 
+    # ── Resolve reference coordinates ─────────────────────────────────────────
+    ref_x, ref_y = _resolve_spec_coords(s, df_history)
+
+    # ── Hard radius filter — expand until we have enough candidates ───────────
+    cands = pd.DataFrame()
+    if "x_svy21" in all_cands.columns and "y_svy21" in all_cands.columns:
+        cx = pd.to_numeric(all_cands["x_svy21"], errors="coerce")
+        cy = pd.to_numeric(all_cands["y_svy21"], errors="coerce")
+        has_coords = cx.notna() & cy.notna()
+        dist_m = np.sqrt((cx - ref_x) ** 2 + (cy - ref_y) ** 2)
+        all_cands["_dist_m"] = dist_m
+
+        for radius in (1000, 2000, 3000, 5000):
+            within = all_cands[has_coords & (dist_m <= radius)]
+            if len(within) >= n * 2:
+                cands = within.copy()
+                break
+        if len(cands) == 0:
+            # No coords or nothing within 5 km — fall back to same district
+            cands = all_cands[
+                ~has_coords | (dist_m > 5000)
+            ].copy()
+            # merge with whatever was within 5 km
+            cands = pd.concat([all_cands[has_coords & (dist_m <= 5000)], cands]).copy()
+            if len(cands) == 0:
+                cands = all_cands.copy()
+    else:
+        cands = all_cands.copy()
+        cands["_dist_m"] = np.nan
+
+    # ── Score within the radius pool ─────────────────────────────────────────
     cands["_score"] = 0.0
 
-    # ── Location proximity ────────────────────────────────────────────────────
-    # Prefer SVY21 Euclidean distance (URA API rows); fall back to district match
-    spec_x = s.get("x_svy21") or s.get("_x_svy21")
-    spec_y = s.get("y_svy21") or s.get("_y_svy21")
-    # If spec has lat/lng but not SVY21, reverse-convert
-    if (spec_x is None) and s.get("lat") is not None:
-        spec_lat, spec_lng = float(s["lat"]), float(s["lng"])
-        # Reverse of svy21_to_wgs84: approximate
-        spec_x = (spec_lng - 103.8333333) * 111279.0 + 28001.642
-        spec_y = (spec_lat - 1.3666667) * 110574.0 + 38744.572
-    elif (spec_x is None):
-        # Use district centroid as fallback
-        dist = int(s["postal_district"])
-        c = _DISTRICT_CENTROIDS.get(dist, (1.35, 103.82))
-        spec_x = (c[1] - 103.8333333) * 111279.0 + 28001.642
-        spec_y = (c[0] - 1.3666667) * 110574.0 + 38744.572
+    # Type match (most important filter — only compare like with like)
+    cands["_score"] += (cands["property_type"] == s["property_type"]).astype(float) * 5
 
-    if "x_svy21" in cands.columns and "y_svy21" in cands.columns:
-        cx = pd.to_numeric(cands["x_svy21"], errors="coerce")
-        cy = pd.to_numeric(cands["y_svy21"], errors="coerce")
-        has_coords = cx.notna() & cy.notna()
-        if has_coords.any():
-            dist_m = np.sqrt((cx - float(spec_x)) ** 2 + (cy - float(spec_y)) ** 2)
-            # Score: <500 m = 5, <1 km = 4, <2 km = 3, <3 km = 2, <5 km = 1
-            prox_score = pd.Series(0.0, index=cands.index)
-            prox_score[has_coords & (dist_m < 500)]   = 5
-            prox_score[has_coords & (dist_m < 1000) & (prox_score < 5)] = 4
-            prox_score[has_coords & (dist_m < 2000) & (prox_score < 4)] = 3
-            prox_score[has_coords & (dist_m < 3000) & (prox_score < 3)] = 2
-            prox_score[has_coords & (dist_m < 5000) & (prox_score < 2)] = 1
-            cands["_score"] += prox_score
-            # Only add district bonus for rows without good SVY21 coverage
-            cands["_score"] += (
-                ~has_coords & (cands["postal_district"] == int(s["postal_district"]))
-            ).astype(float) * 4
-        else:
-            cands["_score"] += (cands["postal_district"] == int(s["postal_district"])).astype(float) * 4
-    else:
-        cands["_score"] += (cands["postal_district"] == int(s["postal_district"])).astype(float) * 4
-
-    # ── Type match ────────────────────────────────────────────────────────────
-    cands["_score"] += (cands["property_type"] == s["property_type"]).astype(float) * 3
-
-    # ── Area similarity ───────────────────────────────────────────────────────
+    # Area similarity: ±15% = 4 pts, ±30% = 2 pts, ±50% = 1 pt
     area = float(s["area_sqft"])
     area_ratio = (cands["area_sqft"] - area).abs() / area
-    cands["_score"] += (area_ratio < 0.20).astype(float) * 3
-    cands["_score"] += (area_ratio < 0.30).astype(float) * 1
+    cands["_score"] += (area_ratio < 0.15).astype(float) * 4
+    cands["_score"] += (area_ratio < 0.30).astype(float) * 2
+    cands["_score"] += (area_ratio < 0.50).astype(float) * 1
 
-    # ── PSF similarity ────────────────────────────────────────────────────────
-    # Use district median as reference PSF for the spec (we don't know target PSF yet)
-    district = int(s["postal_district"])
-    ref_psf = df_history[df_history["postal_district"] == district]["psf"].median()
-    if ref_psf and not np.isnan(ref_psf):
-        psf_ratio = (cands["psf"] - ref_psf).abs() / ref_psf
-        cands["_score"] += (psf_ratio < 0.15).astype(float) * 3
-        cands["_score"] += (psf_ratio < 0.25).astype(float) * 1
-
-    # ── Tenure match ──────────────────────────────────────────────────────────
+    # Tenure match
     tenure_type, _, _ = _parse_tenure(s["tenure_raw"])
     if "tenure_type" in cands.columns:
-        cands["_score"] += (cands["tenure_type"] == tenure_type).astype(float) * 2
+        cands["_score"] += (cands["tenure_type"] == tenure_type).astype(float) * 3
 
-    # ── Floor band match ──────────────────────────────────────────────────────
-    if "floor_band" in cands.columns and s.get("floor_band"):
-        cands["_score"] += (cands["floor_band"] == s.get("floor_band")).astype(float) * 1
-
-    # ── Recency ───────────────────────────────────────────────────────────────
+    # Recency
     months_ago = (sale_date - cands["date_of_sale"]).dt.days / 30
-    cands["_score"] += (months_ago <= 3).astype(float) * 2
-    cands["_score"] += (months_ago <= 6).astype(float) * 1
+    cands["_score"] += (months_ago <= 6).astype(float)  * 3
+    cands["_score"] += (months_ago <= 12).astype(float) * 2
+    cands["_score"] += (months_ago <= 24).astype(float) * 1
 
-    # ── Select top-n ─────────────────────────────────────────────────────────
+    # Closer = better (secondary tiebreaker via distance bucket)
+    if "_dist_m" in cands.columns:
+        d = cands["_dist_m"].fillna(9999)
+        cands["_score"] += (d < 500).astype(float)  * 2
+        cands["_score"] += (d < 1000).astype(float) * 1
+
+    # ── Select top-n, deduplicated by project ─────────────────────────────────
+    # One row per project to avoid a single project flooding the table
+    top_pool = cands.nlargest(n * 5, "_score")
+    seen_projects: set = set()
+    rows_out = []
+    for _, row in top_pool.iterrows():
+        p = str(row.get("project_name", "")).upper()
+        if p not in seen_projects:
+            seen_projects.add(p)
+            rows_out.append(row)
+        if len(rows_out) >= n:
+            break
+
+    if not rows_out:
+        return pd.DataFrame()
+
     output_cols = ["project_name", "property_type", "postal_district",
                    "area_sqft", "psf", "price", "floor_range", "tenure_raw",
                    "date_of_sale", "type_of_sale"]
     available = [c for c in output_cols if c in cands.columns]
-
-    comps = (
-        cands.nlargest(n, "_score")[available]
-        .copy()
-    )
+    comps = pd.DataFrame(rows_out)[available].copy()
     comps["date_of_sale"] = comps["date_of_sale"].dt.strftime("%b %Y")
     rename_map = {
         "project_name":    "Project",
