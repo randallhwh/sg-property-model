@@ -401,7 +401,8 @@ with tab_estimate:
     # Initialise session state defaults
     for _k, _v in [("pg_type","condo"),("pg_dist",10),("pg_area",None),
                    ("pg_tenure","Freehold"),("pg_floor",10),("pg_sale","Resale"),
-                   ("pg_price",0),("pg_project",""),("pg_loaded_url",""),("pg_raw",None)]:
+                   ("pg_price",0),("pg_project",""),("pg_top",None),
+                   ("pg_loaded_url",""),("pg_raw",None)]:
         if _k not in st.session_state:
             st.session_state[_k] = _v
 
@@ -422,6 +423,7 @@ with tab_estimate:
                 st.session_state["pg_sale"]       = _pg.get("sale_type", "Resale")
                 st.session_state["pg_price"]      = int(_pg["listing_price"]) if _pg.get("listing_price") else 0
                 st.session_state["pg_project"]    = _pg.get("project_name", "")
+                st.session_state["pg_top"]        = _pg.get("top_year")
                 st.session_state["pg_loaded_url"] = pg_url
                 st.session_state["pg_raw"]        = _pg
                 _price_str = f" · ${st.session_state['pg_price']:,}" if st.session_state["pg_price"] else ""
@@ -465,6 +467,7 @@ with tab_estimate:
         _def_sale    = st.session_state["pg_sale"]
         _def_price   = st.session_state["pg_price"]
         _def_project = st.session_state["pg_project"]
+        _def_top     = st.session_state["pg_top"]
 
         prop_type = st.selectbox(
             "Property type",
@@ -531,7 +534,7 @@ with tab_estimate:
 
         top_year = st.number_input(
             "TOP year (optional — year project received Temporary Occupation Permit)",
-            min_value=1960, max_value=2030, value=None,
+            min_value=1960, max_value=2030, value=_def_top,
             placeholder="e.g. 2010",
             help="Helps model estimate property age. Leave blank if unknown.",
         )

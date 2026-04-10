@@ -2,14 +2,14 @@
 propertyguru.py — Scrape a PropertyGuru listing URL and return a normalised
 property spec dict ready for the fair value estimator.
 
-Extraction priority:
-  1. JSON-LD structured data  (fastest, most reliable)
-  2. Meta tags / og: tags
-  3. HTML element fallbacks
+Data is extracted from __NEXT_DATA__ → props.pageProps.pageData.data:
+  listingData      — price, area, districtCode, tenure, propertyType, propertyName, postcode
+  listingDetail    — property{topYear,topMonth,tenureCode,typeCode}, propertyUnit{floorLevelCode}
+  detailsData      — metatable items (TOP, floor, tenure text — human-readable backup)
 
 Returns a dict with keys matching the Estimate tab inputs:
   prop_type, district, area_sqft, tenure_raw, floor_level,
-  sale_type, listing_price, project_name, listing_url, raw
+  top_year, sale_type, listing_price, project_name, listing_url, raw
 """
 
 import re
@@ -31,33 +31,99 @@ _HEADERS = {
 
 # ── Property type normalisation ───────────────────────────────────────────────
 
-_TYPE_MAP = {
-    "condominium":          "condo",
-    "condo":                "condo",
-    "apartment":            "condo",
-    "executive condominium":"ec",
-    "ec":                   "ec",
-    "semi-detached":        "semi_d",
-    "semi detached":        "semi_d",
-    "semi-d":               "semi_d",
-    "detached":             "detached",
-    "bungalow":             "detached",
-    "good class bungalow":  "detached",
-    "gcb":                  "detached",
-    "terraced":             "terrace",
-    "terrace":              "terrace",
-    "terrace house":        "terrace",
-    "strata landed":        "strata_landed",
-    "cluster house":        "strata_landed",
+# PropertyGuru typeCode → our model type
+_TYPE_CODE_MAP = {
+    "APT":  "condo",   # Apartment
+    "CONDO":"condo",   # Condominium
+    "EC":   "ec",      # Executive Condominium
+    "SEMI": "semi_d",  # Semi-Detached
+    "DET":  "detached",# Detached / Bungalow
+    "TERRA":"terrace", # Terrace
+    "CLUS": "strata_landed",  # Cluster
+    "STRAT":"strata_landed",  # Strata landed
+    "LAND": "detached",# Landed (generic)
+    "GCB":  "detached",# Good Class Bungalow
 }
 
-def _normalise_type(raw: str | None) -> str:
+_TYPE_TEXT_MAP = {
+    "condominium":           "condo",
+    "condo":                 "condo",
+    "apartment":             "condo",
+    "executive condominium": "ec",
+    "ec":                    "ec",
+    "semi-detached":         "semi_d",
+    "semi detached":         "semi_d",
+    "detached":              "detached",
+    "bungalow":              "detached",
+    "good class bungalow":   "detached",
+    "gcb":                   "detached",
+    "terraced":              "terrace",
+    "terrace":               "terrace",
+    "terrace house":         "terrace",
+    "terraced house":        "terrace",
+    "strata landed":         "strata_landed",
+    "cluster house":         "strata_landed",
+}
+
+def _normalise_type_code(code: str | None) -> str | None:
+    if not code:
+        return None
+    return _TYPE_CODE_MAP.get(code.strip().upper())
+
+def _normalise_type_text(raw: str | None) -> str | None:
     if not raw:
-        return "condo"
-    return _TYPE_MAP.get(raw.strip().lower(), "condo")
+        return None
+    return _TYPE_TEXT_MAP.get(raw.strip().lower())
 
 
-# ── District extraction ───────────────────────────────────────────────────────
+# ── Tenure ────────────────────────────────────────────────────────────────────
+
+def _tenure_from_code(code: str | None, top_year: int | None = None) -> str:
+    """
+    PG tenureCode: F=Freehold, L=Leasehold(99yr), 999=999yr, 9999=9999yr
+    """
+    if not code:
+        return "Freehold"
+    c = str(code).strip().upper()
+    if c in ("F", "FH", "FREEHOLD"):
+        return "Freehold"
+    if c in ("999",):
+        return "999 yrs from 1885"
+    if c in ("9999",):
+        return "9999 yrs"
+    # Leasehold — use top_year as best proxy for lease start
+    if top_year:
+        return f"99 yrs from {top_year}"
+    return "99 yrs from 2000"
+
+
+# ── Floor level ───────────────────────────────────────────────────────────────
+
+_FLOOR_CODE_MAP = {
+    "LOW":        5,
+    "MID":       15,
+    "MIDDLE":    15,
+    "HIGH":      25,
+    "PENTHOUSE": 40,
+    "GROUND":     1,
+    "BASEMENT":  -1,
+}
+
+def _floor_from_code(code: str | None) -> int:
+    if not code:
+        return 10
+    return _FLOOR_CODE_MAP.get(code.strip().upper(), 10)
+
+
+# ── District from districtCode ────────────────────────────────────────────────
+
+def _district_from_code(code: str | None) -> int | None:
+    """'D15' → 15"""
+    if not code:
+        return None
+    m = re.search(r"(\d{1,2})$", str(code).strip())
+    return int(m.group(1)) if m else None
+
 
 def _district_from_postal(postal: str | None) -> int | None:
     """Map a 6-digit Singapore postal code to a district number."""
@@ -100,46 +166,6 @@ def _district_from_postal(postal: str | None) -> int | None:
     return _PREFIX_DIST.get(prefix)
 
 
-def _district_from_text(text: str) -> int | None:
-    """Try to extract district number from free text (e.g. 'District 10')."""
-    m = re.search(r"[Dd]istrict\s*(\d{1,2})|D(\d{2})", text)
-    if m:
-        return int(m.group(1) or m.group(2))
-    return None
-
-
-# ── Floor level extraction ────────────────────────────────────────────────────
-
-def _parse_floor(raw: str | None) -> int:
-    if not raw:
-        return 5
-    m = re.search(r"(\d+)", str(raw))
-    return int(m.group(1)) if m else 5
-
-
-# ── Price extraction ──────────────────────────────────────────────────────────
-
-def _parse_price(raw) -> int | None:
-    if raw is None:
-        return None
-    s = re.sub(r"[^\d]", "", str(raw))
-    return int(s) if s else None
-
-
-# ── Area extraction ───────────────────────────────────────────────────────────
-
-def _parse_area(raw, unit: str = "sqft") -> float | None:
-    if raw is None:
-        return None
-    m = re.search(r"[\d,]+\.?\d*", str(raw).replace(",", ""))
-    if not m:
-        return None
-    val = float(m.group().replace(",", ""))
-    if "sqm" in str(raw).lower() or unit == "sqm":
-        val = round(val * 10.7639, 1)
-    return val
-
-
 # ── URL-only fallback ─────────────────────────────────────────────────────────
 
 def _project_from_url(url: str) -> str:
@@ -149,6 +175,8 @@ def _project_from_url(url: str) -> str:
     slug = re.sub(r"^(for-sale|for-rent|for-lease)-?", "", slug, flags=re.IGNORECASE)
     return slug.replace("-", " ").title().strip()
 
+
+# ── HTTP fetch ────────────────────────────────────────────────────────────────
 
 def _fetch_html(url: str) -> str:
     """
@@ -187,7 +215,6 @@ def _fetch_html(url: str) -> str:
         pass
 
     # Both failed — raise with the original status so callers can handle it
-    import requests
     raise requests.HTTPError(
         f"{first_status} for url: {url}",
         response=type("R", (), {"status_code": first_status if isinstance(first_status, int) else 403})(),
@@ -199,7 +226,11 @@ def _fetch_html(url: str) -> str:
 def scrape(url: str) -> dict:
     """
     Scrape a PropertyGuru listing and return a spec dict.
-    Raises on HTTP error or if the page can't be parsed at all.
+
+    Primary source: __NEXT_DATA__ → pageProps.pageData.data
+      - listingData:   price, floorArea, districtCode, tenure, propertyTypeCode, propertyName
+      - listingDetail.property: topYear, topMonth, tenureCode, typeCode, newProject
+      - listingDetail.propertyUnit: floorLevelCode (LOW/MID/HIGH/PENTHOUSE)
     """
     html = _fetch_html(url)
     soup = BeautifulSoup(html, "html.parser")
@@ -209,7 +240,8 @@ def scrape(url: str) -> dict:
         "district":      None,
         "area_sqft":     None,
         "tenure_raw":    "Freehold",
-        "floor_level":   5,
+        "floor_level":   10,
+        "top_year":      None,
         "sale_type":     "Resale",
         "listing_price": None,
         "project_name":  "",
@@ -218,185 +250,99 @@ def scrape(url: str) -> dict:
         "raw":           {},
     }
 
-    # ── 1. __NEXT_DATA__ (primary — PropertyGuru is Next.js) ──────────────────
+    # ── Parse __NEXT_DATA__ ───────────────────────────────────────────────────
     next_tag = soup.find("script", id="__NEXT_DATA__")
-    listing  = {}
-    if next_tag:
+    if not next_tag:
+        result["project_name"] = _project_from_url(url)
+        return result
+
+    try:
+        nd = json.loads(next_tag.string or "")
+    except json.JSONDecodeError:
+        result["project_name"] = _project_from_url(url)
+        return result
+
+    # Navigate to pageData.data (current PG structure as of 2025)
+    page_data = (
+        nd.get("props", {})
+          .get("pageProps", {})
+          .get("pageData", {})
+          .get("data", {})
+    )
+
+    ld   = page_data.get("listingData", {})       # flat listing fields
+    det  = page_data.get("listingDetail", {})      # nested detail object
+    prop = det.get("property", {})                 # project-level info
+    pu   = det.get("propertyUnit", {})             # unit-level info
+
+    result["raw"] = {k: v for k, v in ld.items() if not isinstance(v, (dict, list))}
+
+    # ── Price ─────────────────────────────────────────────────────────────────
+    price_val = ld.get("price") or det.get("price", {}).get("value")
+    if price_val:
         try:
-            nd = json.loads(next_tag.string or "")
-            # Walk the props tree to find the listing object
-            props = nd.get("props", {}).get("pageProps", {})
-            # Try common key names
-            for key in ("listing", "listingDetail", "data", "property"):
-                if key in props and isinstance(props[key], dict):
-                    listing = props[key]
-                    break
-            # Sometimes nested deeper
-            if not listing:
-                for v in props.values():
-                    if isinstance(v, dict) and any(k in v for k in ("listingId", "listing_id", "price")):
-                        listing = v
-                        break
-            result["raw"] = listing
-        except (json.JSONDecodeError, AttributeError):
+            result["listing_price"] = int(price_val)
+        except (TypeError, ValueError):
             pass
 
-    if listing:
-        # Price
-        for pk in ("askingPrice", "price", "priceForDisplay"):
-            if listing.get(pk):
-                result["listing_price"] = _parse_price(listing[pk])
-                break
+    # ── Area ──────────────────────────────────────────────────────────────────
+    area = ld.get("floorArea") or ld.get("landArea")
+    if area:
+        try:
+            result["area_sqft"] = float(area)
+        except (TypeError, ValueError):
+            pass
 
-        # Area
-        for ak in ("floorArea", "landArea", "area", "builtUpArea"):
-            if listing.get(ak):
-                unit = "sqm" if listing.get("floorAreaUnit", "sqft").lower() in ("sqm", "m2") else "sqft"
-                result["area_sqft"] = _parse_area(listing[ak], unit)
-                break
+    # ── Project name ──────────────────────────────────────────────────────────
+    name = (prop.get("name") or ld.get("propertyName") or ld.get("localizedTitle") or "").strip()
+    if name and "propertyguru" not in name.lower():
+        result["project_name"] = name
+    if not result["project_name"]:
+        result["project_name"] = _project_from_url(url)
 
-        # Property type
-        for tk in ("propertyType", "property_type", "type", "categoryName"):
-            if listing.get(tk):
-                result["prop_type"] = _normalise_type(str(listing[tk]))
-                break
-
-        # District
-        for dk in ("districtId", "district", "postalDistrict"):
-            if listing.get(dk):
-                try:
-                    result["district"] = int(str(listing[dk]).lstrip("D").lstrip("d"))
-                except ValueError:
-                    pass
-                break
-        if result["district"] is None:
-            postal = listing.get("postalCode") or listing.get("postal_code")
-            if postal:
-                result["district"] = _district_from_postal(str(postal))
-
-        # Project / building name
-        for nk in ("projectName", "project_name", "buildingName", "name", "title"):
-            v = listing.get(nk, "")
-            if v and "propertyguru" not in str(v).lower():
-                result["project_name"] = str(v)
-                break
-
-        # Tenure
-        tenure_raw = listing.get("tenure") or listing.get("tenureLabel") or ""
-        if tenure_raw:
-            if "freehold" in tenure_raw.lower():
-                result["tenure_raw"] = "Freehold"
-            elif "999" in tenure_raw:
-                result["tenure_raw"] = "999 yrs from 1885"
-            else:
-                m = re.search(r"(\d{4})", tenure_raw)
-                result["tenure_raw"] = f"99 yrs from {m.group(1)}" if m else "99 yrs from 2000"
-
-        # Floor
-        for fk in ("floorLevel", "floor", "level", "floorRange"):
-            if listing.get(fk):
-                result["floor_level"] = _parse_floor(str(listing[fk]))
-                break
-
-        # Sale type
-        st_raw = str(listing.get("listingType") or listing.get("saleType") or "")
-        if re.search(r"new|launch|developer", st_raw, re.IGNORECASE):
-            result["sale_type"] = "New Sale"
-        elif re.search(r"sub", st_raw, re.IGNORECASE):
-            result["sale_type"] = "Sub Sale"
-
-    # ── 2. JSON-LD fallback ───────────────────────────────────────────────────
-    if not listing:
-        for tag in soup.find_all("script", type="application/ld+json"):
-            try:
-                data = json.loads(tag.string or "")
-                if not isinstance(data, dict):
-                    continue
-                if "offers" in data:
-                    result["listing_price"] = _parse_price(
-                        data["offers"].get("price") or data["offers"].get("lowPrice")
-                    )
-                if "floorSize" in data:
-                    fs = data["floorSize"]
-                    unit = fs.get("unitCode", "sqft") if isinstance(fs, dict) else "sqft"
-                    result["area_sqft"] = _parse_area(
-                        fs.get("value") if isinstance(fs, dict) else fs, unit
-                    )
-                addr = data.get("address") or {}
-                if isinstance(addr, dict):
-                    result["district"] = _district_from_postal(addr.get("postalCode"))
-                if data.get("name") and "propertyguru" not in data["name"].lower():
-                    result["project_name"] = data["name"]
-            except (json.JSONDecodeError, AttributeError):
-                continue
-
-    # ── 3. Page text fallbacks ────────────────────────────────────────────────
-    page_text = soup.get_text(" ", strip=True)
-
-    # Property type — look specifically for the "Property Type" label in Property Details
-    # e.g. "Property Type Terrace House" or "Property Type\nTerrace House"
-    _pt_match = re.search(
-        r"property\s*type[\s:\-]+([A-Za-z\s\-]+?)(?:\n|floor|tenure|district|price|bedrooms|$)",
-        page_text, re.IGNORECASE
+    # ── District ──────────────────────────────────────────────────────────────
+    result["district"] = (
+        _district_from_code(ld.get("districtCode"))
+        or _district_from_postal(ld.get("postcode"))
     )
-    if _pt_match:
-        result["prop_type"] = _normalise_type(_pt_match.group(1).strip())
-    else:
-        # Fallback: scan for specific landed/type keywords only (avoid generic "condo" from nav)
-        _type_patterns = [
-            (r"good class bungalow|gcb",         "detached"),
-            (r"bungalow|detached house",          "detached"),
-            (r"semi.?detached",                   "semi_d"),
-            (r"terrace\s*house|terraced\s*house", "terrace"),
-            (r"cluster house|strata landed",      "strata_landed"),
-            (r"executive condominium",            "ec"),
-        ]
-        for pattern, ptype in _type_patterns:
-            if re.search(pattern, page_text, re.IGNORECASE):
-                result["prop_type"] = ptype
-                break
 
-    if result["listing_price"] is None:
-        m = re.search(r"S?\$\s*([\d,]+)", page_text)
-        if m:
-            result["listing_price"] = _parse_price(m.group(1))
+    # ── TOP year ──────────────────────────────────────────────────────────────
+    top_yr = prop.get("topYear")
+    if top_yr:
+        try:
+            result["top_year"] = int(top_yr)
+        except (TypeError, ValueError):
+            pass
 
-    if result["area_sqft"] is None:
-        m = re.search(r"([\d,]+)\s*(sqft|sq ft|sqm|sq m)", page_text, re.IGNORECASE)
-        if m:
-            result["area_sqft"] = _parse_area(m.group(1), m.group(2).lower().replace(" ", ""))
+    # ── Tenure ────────────────────────────────────────────────────────────────
+    tenure_code = prop.get("tenureCode") or ld.get("tenure")
+    result["tenure_raw"] = _tenure_from_code(tenure_code, result["top_year"])
 
-    # Floor level from property details text
-    _floor_m = re.search(
-        r"(?:floor\s*level|floor\s*no\.?|level)\s*[:\-]?\s*(\d+)",
-        page_text, re.IGNORECASE
+    # ── Property type ─────────────────────────────────────────────────────────
+    # Priority: prop.typeCode > ld.propertyTypeCode > ld.propertyType (text)
+    ptype = (
+        _normalise_type_code(prop.get("typeCode"))
+        or _normalise_type_code(ld.get("propertyTypeCode"))
+        or _normalise_type_text(ld.get("propertyType"))
+        or "condo"
     )
-    if _floor_m:
-        result["floor_level"] = _parse_floor(_floor_m.group(1))
+    result["prop_type"] = ptype
 
-    if result["district"] is None:
-        m = re.search(r"Singapore\s+(\d{6})", page_text)
-        if m:
-            result["district"] = _district_from_postal(m.group(1))
-        if result["district"] is None:
-            result["district"] = _district_from_text(page_text)
+    # ── Floor level ───────────────────────────────────────────────────────────
+    floor_code = pu.get("floorLevelCode")
+    if floor_code:
+        result["floor_level"] = _floor_from_code(floor_code)
 
-    if not result["project_name"] or "propertyguru" in result["project_name"].lower():
-        slug = url.rstrip("/").split("/")[-1]
-        slug = re.sub(r"-?\d{6,}$", "", slug)
-        slug = re.sub(r"^(for-sale|for-rent|for-lease)-?", "", slug, flags=re.IGNORECASE)
-        result["project_name"] = slug.replace("-", " ").title().strip()
-
-    if not re.search(r"freehold", page_text, re.IGNORECASE):
-        if re.search(r"999.?yr", page_text, re.IGNORECASE):
-            result["tenure_raw"] = "999 yrs from 1885"
-        elif re.search(r"leasehold|99.?yr", page_text, re.IGNORECASE):
-            m = re.search(r"99.?yr[s]?\s+from\s+(\d{4})", page_text, re.IGNORECASE)
-            result["tenure_raw"] = f"99 yrs from {m.group(1)}" if m else "99 yrs from 2000"
-
-    if re.search(r"new launch|new sale|direct developer", page_text, re.IGNORECASE):
+    # ── Sale type ─────────────────────────────────────────────────────────────
+    is_new = prop.get("newProject") or ld.get("isNewProject")
+    listing_type = str(ld.get("listingType") or "").upper()
+    if is_new:
         result["sale_type"] = "New Sale"
-    elif re.search(r"sub.?sale", page_text, re.IGNORECASE):
-        result["sale_type"] = "Sub Sale"
+    elif "RENT" in listing_type:
+        result["sale_type"] = "Resale"  # shouldn't happen on sale listings
+    # default stays "Resale"
+
+    # ── Address ───────────────────────────────────────────────────────────────
+    result["address"] = ld.get("streetName", "")
 
     return result
