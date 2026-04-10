@@ -93,7 +93,12 @@ _TENURE_PATTERNS = [
     # "99 years from 2005"
     (re.compile(r"(\d+)\s*year[s]?\s*from\s*(\d{4})", re.I),
      lambda m: (int(m.group(1)), int(m.group(2)))),
-    # freehold / 999 / 9999
+    # "99 yrs lease commencing from 2012" (URA API format)
+    (re.compile(r"(\d+)\s*yr[s]?\s+(?:lease\s+)?commencing\s+from\s+(\d{4})", re.I),
+     lambda m: (int(m.group(1)), int(m.group(2)))),
+    # "99 yrs from 2005" (yrs without years)
+    (re.compile(r"(\d+)\s*yr[s]?\s+from\s+(\d{4})", re.I),
+     lambda m: (int(m.group(1)), int(m.group(2)))),
 ]
 
 def _parse_date(s):

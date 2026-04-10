@@ -391,10 +391,28 @@ def get_comps(
 
     output_cols = ["project_name", "property_type", "postal_district",
                    "area_sqft", "psf", "price", "floor_range", "tenure_raw",
+                   "tenure_type", "tenure_start_year",
                    "date_of_sale", "type_of_sale"]
     available = [c for c in output_cols if c in cands.columns]
     comps = pd.DataFrame(rows_out)[available].copy()
     comps["date_of_sale"] = comps["date_of_sale"].dt.strftime("%b %Y")
+
+    # ── Derive TOP year column ────────────────────────────────────────────────
+    # Leasehold: tenure_start_year is a close proxy for TOP (within ~1-2 years)
+    # Freehold / 999yr: show "FH" / "999yr" — no TOP inference possible
+    def _top_label(row):
+        tt = row.get("tenure_type", "")
+        if tt in ("freehold", "9999yr"):
+            return "FH"
+        if tt == "999yr":
+            return "999yr"
+        yr = row.get("tenure_start_year")
+        if pd.notna(yr):
+            return str(int(yr))
+        return "-"
+
+    comps["TOP"] = comps.apply(_top_label, axis=1)
+
     rename_map = {
         "project_name":    "Project",
         "property_type":   "Type",
@@ -407,7 +425,13 @@ def get_comps(
         "date_of_sale":    "Date",
         "type_of_sale":    "Sale Type",
     }
+    drop_cols = ["tenure_type", "tenure_start_year"]
+    comps = comps.drop(columns=[c for c in drop_cols if c in comps.columns])
     comps = comps.rename(columns={k: v for k, v in rename_map.items() if k in comps.columns})
+    # Reorder so TOP appears after Tenure
+    col_order = ["Project", "Type", "D", "Area (sqft)", "PSF ($)", "Price ($)",
+                 "Floor", "Tenure", "TOP", "Date", "Sale Type"]
+    comps = comps[[c for c in col_order if c in comps.columns]]
     if "PSF ($)" in comps.columns:
         comps["PSF ($)"] = comps["PSF ($)"].round(0).astype(int)
     if "Price ($)" in comps.columns:
