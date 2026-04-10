@@ -513,6 +513,13 @@ with tab_estimate:
             placeholder="e.g. THE SAIL @ MARINA BAY",
         )
 
+        top_year = st.number_input(
+            "TOP year (optional — year project received Temporary Occupation Permit)",
+            min_value=1960, max_value=2030, value=None,
+            placeholder="e.g. 2010",
+            help="Helps model estimate property age. Leave blank if unknown.",
+        )
+
         estimate_btn = st.button("Estimate Fair Value", type="primary", width='stretch')
 
     # ── Results panel ─────────────────────────────────────────────────────────
@@ -548,6 +555,7 @@ with tab_estimate:
                 "floor_midpoint":  float(floor_level),
                 "type_of_sale":    sale_type,
                 "project_name":    project_name.strip().upper() or None,
+                "top_year":        int(top_year) if top_year else None,
             }
 
             # ── With trained model ────────────────────────────────────────────

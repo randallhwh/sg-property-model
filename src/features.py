@@ -169,6 +169,19 @@ MRT_TIERS  = MRT_DF["line_tier"].values
 # CBD centroid (Raffles Place)
 CBD_LAT, CBD_LNG = 1.2842, 103.8513
 
+# ── SVY21 → WGS84 conversion ─────────────────────────────────────────────────
+
+def svy21_to_wgs84(easting: float, northing: float) -> tuple[float, float]:
+    """
+    Convert SVY21 projected coordinates (metres) to WGS84 lat/lng.
+    Linear approximation valid for Singapore — error < 1 m.
+    URA API: x = Easting, y = Northing.
+    """
+    lat = 1.3666667 + (northing - 38744.572) / 110574.0
+    lng = 103.8333333 + (easting  - 28001.642) / 111279.0
+    return lat, lng
+
+
 # ── Haversine distance ────────────────────────────────────────────────────────
 
 def haversine_m(lat1, lon1, lat2, lon2) -> float:
@@ -319,6 +332,12 @@ def add_time_features(df: pd.DataFrame) -> pd.DataFrame:
         df["age_at_sale"] = df["age_at_sale"].clip(0, 80)
     else:
         df["age_at_sale"] = np.nan
+    # Years since TOP (if top_year provided as a column or scalar)
+    if "top_year" in df.columns:
+        df["years_since_top"] = (df["year"] - pd.to_numeric(df["top_year"], errors="coerce"))
+        df["years_since_top"] = df["years_since_top"].clip(0, 50)
+    else:
+        df["years_since_top"] = np.nan
     return df
 
 # ── Rolling market context features ──────────────────────────────────────────
@@ -425,6 +444,7 @@ FEATURE_COLS = [
     "is_freehold", "remaining_lease",
     # Time
     "year", "quarter", "month_sin", "month_cos", "age_at_sale",
+    "years_since_top",
     # Sale type
     "sale_type_code",
     # Market context
@@ -448,11 +468,45 @@ def build_features(
 ) -> pd.DataFrame:
     """
     Full feature engineering pipeline. Returns df with all feature columns added.
-    Set geocode=True to call OneMap API (slow, needs internet).
+    Set geocode=True to also call OneMap API for rows without SVY21 coords.
+
+    SVY21 → lat/lng derivation runs automatically when x_svy21/y_svy21 are
+    present (URA API data), so MRT distance features are always populated for
+    those rows without any API calls.
     """
+    # ── Auto-derive lat/lng from SVY21 coordinates (URA API provides these) ──
+    if "x_svy21" in df.columns and "y_svy21" in df.columns:
+        has_svy = (
+            pd.to_numeric(df["x_svy21"], errors="coerce").notna() &
+            pd.to_numeric(df["y_svy21"], errors="coerce").notna()
+        )
+        need_ll = has_svy & (
+            df.get("lat", pd.Series(np.nan, index=df.index)).isna() |
+            ("lat" not in df.columns)
+        )
+        if need_ll.any():
+            e = pd.to_numeric(df.loc[need_ll, "x_svy21"], errors="coerce")
+            n = pd.to_numeric(df.loc[need_ll, "y_svy21"], errors="coerce")
+            ll = pd.DataFrame({"lat": 1.3666667 + (n - 38744.572) / 110574.0,
+                               "lng": 103.8333333 + (e - 28001.642) / 111279.0})
+            if "lat" not in df.columns:
+                df["lat"] = np.nan
+                df["lng"] = np.nan
+            df.loc[need_ll, "lat"] = ll["lat"].values
+            df.loc[need_ll, "lng"] = ll["lng"].values
+            n_derived = need_ll.sum()
+            if n_derived > 0:
+                print(f"  SVY21 -> lat/lng derived for {n_derived:,} rows")
+
+    # ── Always compute distance features (uses lat/lng if available) ──────────
+    df = add_distance_features(df)
+
+    # ── Optional: geocode remaining rows without coords via OneMap ────────────
     if geocode:
-        df = geocode_projects(df)
-        df = add_distance_features(df)
+        no_ll = df["lat"].isna() if "lat" in df.columns else pd.Series(True, index=df.index)
+        if no_ll.any():
+            df = geocode_projects(df)
+            df = add_distance_features(df)
 
     df = add_time_features(df)
     df = add_rolling_features(df)

@@ -34,7 +34,7 @@ def run(args):
     print(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("=" * 60)
 
-    # ── 1. Ingest ─────────────────────────────────────────────────────────────
+    # -- 1. Ingest -------------------------------------------------------------
     if not args.skip_ingest:
         print("\n[1/3] Ingesting URA data…")
 
@@ -46,7 +46,7 @@ def run(args):
             out = pathlib.Path(args.raw_dir) / f"ura_api_{_dt.date.today()}.csv"
             out.parent.mkdir(parents=True, exist_ok=True)
             df_api.to_csv(out, index=False)
-            print(f"      Saved API data → {out}")
+            print(f"      Saved API data -> {out}")
 
         df_raw = load_ura_folder(args.raw_dir)
         print(f"      Loaded {len(df_raw):,} raw rows")
@@ -66,50 +66,50 @@ def run(args):
         print("\nData-only mode. Exiting.")
         return
 
-    # ── 2. Feature matrix ─────────────────────────────────────────────────────
-    print("\n── Building feature matrix ──")
+    # -- 2. Feature matrix -----------------------------------------------------
+    print("\n-- Building feature matrix --")
     X, feat_cols = get_feature_matrix(df)
     y = df["psf"].values
     print(f"   Features: {len(feat_cols)}  |  Rows: {len(X):,}")
 
-    # ── 3. Walk-forward CV (optional) ─────────────────────────────────────────
+    # -- 3. Walk-forward CV (optional) -----------------------------------------
     if args.cv:
-        print("\n── Walk-forward cross-validation ──")
+        print("\n-- Walk-forward cross-validation --")
         cv_results = M.walk_forward_cv(df, X, pd.Series(y))
         print("\nCV Summary:")
         print(cv_results.to_string(index=False))
         avg_mape = cv_results["mape"].mean()
         print(f"\nMean MAPE across years: {avg_mape:.2f}%")
 
-    # ── 4. Train final model ──────────────────────────────────────────────────
-    print("\n── Training final model ──")
+    # -- 4. Train final model --------------------------------------------------
+    print("\n-- Training final model --")
     cutoff = df["date_of_sale"].max() - pd.DateOffset(months=6)
     train_mask = df["date_of_sale"] < cutoff
     test_mask  = ~train_mask
 
-    print(f"   Train set: {train_mask.sum():,} rows  ({df.loc[train_mask, 'date_of_sale'].min().date()} → {cutoff.date()})")
-    print(f"   Hold-out:  {test_mask.sum():,} rows  ({cutoff.date()} → {df['date_of_sale'].max().date()})")
+    print(f"   Train set: {train_mask.sum():,} rows  ({df.loc[train_mask, 'date_of_sale'].min().date()} -> {cutoff.date()})")
+    print(f"   Hold-out:  {test_mask.sum():,} rows  ({cutoff.date()} -> {df['date_of_sale'].max().date()})")
 
     X_tr, y_tr = X[train_mask], pd.Series(y)[train_mask]
     X_va, y_va = X[test_mask],  pd.Series(y)[test_mask]
 
     model = M.train(X_tr, y_tr, eval_set=(X_va, y_va))
 
-    # ── 5. Evaluate ───────────────────────────────────────────────────────────
+    # -- 5. Evaluate -----------------------------------------------------------
     metrics = M.evaluate(model, X_va, y_va)
-    print("\n── Hold-out evaluation ──")
+    print("\n-- Hold-out evaluation --")
     print(f"   MAE:         ${metrics['mae']:,.1f} psf")
     print(f"   RMSE:        ${metrics['rmse']:,.1f} psf")
     print(f"   MAPE:        {metrics['mape']:.2f}%")
     print(f"   Within 10%:  {metrics['within_10pct']:.1f}% of transactions")
     print(f"   Within 20%:  {metrics['within_20pct']:.1f}% of transactions")
 
-    # ── 6. Quantile models ────────────────────────────────────────────────────
-    print("\n── Training quantile models (for CI) ──")
+    # -- 6. Quantile models ----------------------------------------------------
+    print("\n-- Training quantile models (for CI) --")
     q_models = M.train_quantile_models(X_tr, y_tr, quantiles=(0.10, 0.90))
     print("   Done (P10 / P90)")
 
-    # ── 7. Save ───────────────────────────────────────────────────────────────
+    # -- 7. Save ---------------------------------------------------------------
     metadata = {
         "trained_at":    datetime.now().isoformat(),
         "n_train":       int(train_mask.sum()),
@@ -118,12 +118,12 @@ def run(args):
     }
     M.save(model, feat_cols, metadata, q_models, args.model_dir)
 
-    # ── 8. Feature importance ─────────────────────────────────────────────────
-    print("\n── Top feature importances ──")
+    # -- 8. Feature importance -------------------------------------------------
+    print("\n-- Top feature importances --")
     imp = pd.Series(model.feature_importances_, index=X.columns)
     top = imp.sort_values(ascending=False).head(15)
     for feat, val in top.items():
-        bar = "█" * int(val / top.max() * 20)
+        bar = "#" * int(val / top.max() * 20)
         print(f"   {feat:<35} {bar}")
 
     print("\n" + "=" * 60)

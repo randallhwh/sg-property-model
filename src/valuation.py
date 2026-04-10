@@ -31,6 +31,7 @@ SPEC_DEFAULTS = {
     "floor_midpoint":   None,       # will impute from district median
     "floor_range":      None,
     "project_name":     None,
+    "top_year":         None,       # year of TOP (Temporary Occupation Permit)
     "lat":              None,
     "lng":              None,
     "date_of_sale":     None,       # defaults to today
@@ -114,7 +115,7 @@ def _spec_to_row(spec: dict) -> pd.DataFrame:
 
 def _build_spec_features(row: pd.DataFrame, df_history: pd.DataFrame) -> pd.DataFrame:
     """Engineer features for a single spec row, using history for context."""
-    # Time features
+    # Time features (add_time_features reads top_year if present)
     row = F.add_time_features(row)
 
     # Distance features (lat/lng available)
@@ -130,6 +131,14 @@ def _build_spec_features(row: pd.DataFrame, df_history: pd.DataFrame) -> pd.Data
         row["age_at_sale"] = row["age_at_sale"].clip(0, 80)
     else:
         row["age_at_sale"] = 10.0
+
+    # Years since TOP — already computed by add_time_features if top_year column present
+    if "years_since_top" not in row.columns or row["years_since_top"].isna().all():
+        top_yr = row["top_year"].iloc[0] if "top_year" in row.columns else None
+        if top_yr is not None and not pd.isna(top_yr):
+            row["years_since_top"] = max(0, int(row["year"].iloc[0]) - int(top_yr))
+        else:
+            row["years_since_top"] = np.nan
 
     # Remaining lease
     if "remaining_lease" not in row.columns or row["remaining_lease"].isna().all():
@@ -196,13 +205,24 @@ def get_comps(
     spec: dict,
     df_history: pd.DataFrame,
     n: int = 10,
-    lookback_months: int = 18,
+    lookback_months: int = 24,
 ) -> pd.DataFrame:
     """
-    Find comparable transactions for a given spec.
-    Scoring: property_type match, district match, area within ±30%, floor band match,
-    tenure match, date recency.
+    Find the best comparable transactions using a nearest-neighbour scoring system.
+
+    Scoring weights:
+      - Same project           : 6 pts
+      - Location proximity     : up to 5 pts  (SVY21 metres if available, else district)
+      - Type match             : 3 pts
+      - Same district          : 4 pts (only when location score < 5)
+      - Area ±20%              : 3 pts  / ±30% : 1 pt
+      - PSF within ±15%        : 3 pts  / ±25% : 1 pt
+      - Tenure match           : 2 pts
+      - Floor band match       : 1 pt
+      - Recency (≤3 months)    : 2 pts  / ≤6m : 1 pt
     """
+    from src.pipeline import parse_tenure as _parse_tenure
+
     s = {**SPEC_DEFAULTS, **spec}
     sale_date = pd.Timestamp(s["date_of_sale"] or date.today())
     cutoff = sale_date - pd.DateOffset(months=lookback_months)
@@ -211,59 +231,113 @@ def get_comps(
     if len(cands) == 0:
         cands = df_history.copy()
 
-    cands["_score"] = 0
+    cands["_score"] = 0.0
 
-    # Type match (weight 3)
-    cands["_score"] += (cands["property_type"] == s["property_type"]).astype(int) * 3
+    # ── Same project ──────────────────────────────────────────────────────────
+    proj = str(s.get("project_name") or "").strip().upper()
+    if proj:
+        cands["_score"] += (cands["project_name"].str.upper() == proj).astype(float) * 6
 
-    # Same district (weight 4) vs adjacent CCR/RCR/OCR tier (weight 2)
-    cands["_score"] += (cands["postal_district"] == int(s["postal_district"])).astype(int) * 4
+    # ── Location proximity ────────────────────────────────────────────────────
+    # Prefer SVY21 Euclidean distance (URA API rows); fall back to district match
+    spec_x = s.get("x_svy21") or s.get("_x_svy21")
+    spec_y = s.get("y_svy21") or s.get("_y_svy21")
+    # If spec has lat/lng but not SVY21, reverse-convert
+    if (spec_x is None) and s.get("lat") is not None:
+        spec_lat, spec_lng = float(s["lat"]), float(s["lng"])
+        # Reverse of svy21_to_wgs84: approximate
+        spec_x = (spec_lng - 103.8333333) * 111279.0 + 28001.642
+        spec_y = (spec_lat - 1.3666667) * 110574.0 + 38744.572
+    elif (spec_x is None):
+        # Use district centroid as fallback
+        dist = int(s["postal_district"])
+        c = _DISTRICT_CENTROIDS.get(dist, (1.35, 103.82))
+        spec_x = (c[1] - 103.8333333) * 111279.0 + 28001.642
+        spec_y = (c[0] - 1.3666667) * 110574.0 + 38744.572
 
-    # Area similarity: within ±20% = 3 pts, ±30% = 1 pt
+    if "x_svy21" in cands.columns and "y_svy21" in cands.columns:
+        cx = pd.to_numeric(cands["x_svy21"], errors="coerce")
+        cy = pd.to_numeric(cands["y_svy21"], errors="coerce")
+        has_coords = cx.notna() & cy.notna()
+        if has_coords.any():
+            dist_m = np.sqrt((cx - float(spec_x)) ** 2 + (cy - float(spec_y)) ** 2)
+            # Score: <500 m = 5, <1 km = 4, <2 km = 3, <3 km = 2, <5 km = 1
+            prox_score = pd.Series(0.0, index=cands.index)
+            prox_score[has_coords & (dist_m < 500)]   = 5
+            prox_score[has_coords & (dist_m < 1000) & (prox_score < 5)] = 4
+            prox_score[has_coords & (dist_m < 2000) & (prox_score < 4)] = 3
+            prox_score[has_coords & (dist_m < 3000) & (prox_score < 3)] = 2
+            prox_score[has_coords & (dist_m < 5000) & (prox_score < 2)] = 1
+            cands["_score"] += prox_score
+            # Only add district bonus for rows without good SVY21 coverage
+            cands["_score"] += (
+                ~has_coords & (cands["postal_district"] == int(s["postal_district"]))
+            ).astype(float) * 4
+        else:
+            cands["_score"] += (cands["postal_district"] == int(s["postal_district"])).astype(float) * 4
+    else:
+        cands["_score"] += (cands["postal_district"] == int(s["postal_district"])).astype(float) * 4
+
+    # ── Type match ────────────────────────────────────────────────────────────
+    cands["_score"] += (cands["property_type"] == s["property_type"]).astype(float) * 3
+
+    # ── Area similarity ───────────────────────────────────────────────────────
     area = float(s["area_sqft"])
     area_ratio = (cands["area_sqft"] - area).abs() / area
-    cands["_score"] += (area_ratio < 0.20).astype(int) * 3
-    cands["_score"] += (area_ratio < 0.30).astype(int) * 1
+    cands["_score"] += (area_ratio < 0.20).astype(float) * 3
+    cands["_score"] += (area_ratio < 0.30).astype(float) * 1
 
-    # Tenure match (weight 2)
-    tenure_type, _, _ = __import__("src.pipeline", fromlist=["parse_tenure"]).parse_tenure(s["tenure_raw"])
+    # ── PSF similarity ────────────────────────────────────────────────────────
+    # Use district median as reference PSF for the spec (we don't know target PSF yet)
+    district = int(s["postal_district"])
+    ref_psf = df_history[df_history["postal_district"] == district]["psf"].median()
+    if ref_psf and not np.isnan(ref_psf):
+        psf_ratio = (cands["psf"] - ref_psf).abs() / ref_psf
+        cands["_score"] += (psf_ratio < 0.15).astype(float) * 3
+        cands["_score"] += (psf_ratio < 0.25).astype(float) * 1
+
+    # ── Tenure match ──────────────────────────────────────────────────────────
+    tenure_type, _, _ = _parse_tenure(s["tenure_raw"])
     if "tenure_type" in cands.columns:
-        cands["_score"] += (cands["tenure_type"] == tenure_type).astype(int) * 2
+        cands["_score"] += (cands["tenure_type"] == tenure_type).astype(float) * 2
 
-    # Floor band match (weight 1)
+    # ── Floor band match ──────────────────────────────────────────────────────
     if "floor_band" in cands.columns and s.get("floor_band"):
-        cands["_score"] += (cands["floor_band"] == s.get("floor_band")).astype(int) * 1
+        cands["_score"] += (cands["floor_band"] == s.get("floor_band")).astype(float) * 1
 
-    # Recency bonus (weight 1 per quarter in last year)
+    # ── Recency ───────────────────────────────────────────────────────────────
     months_ago = (sale_date - cands["date_of_sale"]).dt.days / 30
-    cands["_score"] += (months_ago <= 3).astype(int) * 2
-    cands["_score"] += (months_ago <= 6).astype(int) * 1
+    cands["_score"] += (months_ago <= 3).astype(float) * 2
+    cands["_score"] += (months_ago <= 6).astype(float) * 1
 
-    # Sort and take top n
+    # ── Select top-n ─────────────────────────────────────────────────────────
+    output_cols = ["project_name", "property_type", "postal_district",
+                   "area_sqft", "psf", "price", "floor_range", "tenure_raw",
+                   "date_of_sale", "type_of_sale"]
+    available = [c for c in output_cols if c in cands.columns]
+
     comps = (
-        cands.sort_values("_score", ascending=False)
-        .head(n * 3)  # oversample then filter
-        .nlargest(n, "_score")
-        [["project_name", "property_type", "postal_district",
-          "area_sqft", "psf", "price", "floor_range", "tenure_raw",
-          "date_of_sale", "type_of_sale"]]
+        cands.nlargest(n, "_score")[available]
         .copy()
     )
     comps["date_of_sale"] = comps["date_of_sale"].dt.strftime("%b %Y")
-    comps = comps.rename(columns={
-        "project_name":   "Project",
-        "property_type":  "Type",
+    rename_map = {
+        "project_name":    "Project",
+        "property_type":   "Type",
         "postal_district": "D",
-        "area_sqft":      "Area (sqft)",
-        "psf":            "PSF ($)",
-        "price":          "Price ($)",
-        "floor_range":    "Floor",
-        "tenure_raw":     "Tenure",
-        "date_of_sale":   "Date",
-        "type_of_sale":   "Sale Type",
-    })
-    comps["PSF ($)"] = comps["PSF ($)"].round(0).astype(int)
-    comps["Price ($)"] = comps["Price ($)"].fillna(0).astype(int)
+        "area_sqft":       "Area (sqft)",
+        "psf":             "PSF ($)",
+        "price":           "Price ($)",
+        "floor_range":     "Floor",
+        "tenure_raw":      "Tenure",
+        "date_of_sale":    "Date",
+        "type_of_sale":    "Sale Type",
+    }
+    comps = comps.rename(columns={k: v for k, v in rename_map.items() if k in comps.columns})
+    if "PSF ($)" in comps.columns:
+        comps["PSF ($)"] = comps["PSF ($)"].round(0).astype(int)
+    if "Price ($)" in comps.columns:
+        comps["Price ($)"] = comps["Price ($)"].fillna(0).astype(int)
     return comps.reset_index(drop=True)
 
 

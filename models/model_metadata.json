@@ -1,1 +1,1 @@
-{"trained_at": "2026-04-10T21:10:59.282856", "n_train": 122037, "n_holdout": 13767, "holdout_mae": 108.6, "holdout_rmse": 168.9, "holdout_mape": 5.35, "holdout_within_10pct": 88.6, "holdout_within_20pct": 97.5, "holdout_n": 13767}
+{"trained_at": "2026-04-11T00:03:50.558360", "n_train": 122037, "n_holdout": 13767, "holdout_mae": 106.0, "holdout_rmse": 165.7, "holdout_mape": 5.19, "holdout_within_10pct": 89.3, "holdout_within_20pct": 97.5, "holdout_n": 13767}

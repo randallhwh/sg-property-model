@@ -403,7 +403,7 @@ def clean_transactions(df: pd.DataFrame) -> pd.DataFrame:
 
     print(
         f"Clean: {len(df):,} rows | "
-        f"{df['date_of_sale'].min().date()} → {df['date_of_sale'].max().date()} | "
+        f"{df['date_of_sale'].min().date()} to {df['date_of_sale'].max().date()} | "
         f"{df['project_name'].nunique():,} projects | "
         f"PSF median ${df['psf'].median():,.0f}"
     )
@@ -413,7 +413,7 @@ def clean_transactions(df: pd.DataFrame) -> pd.DataFrame:
 def save_processed(df: pd.DataFrame, path: str = "data/processed/transactions.parquet"):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     df.to_parquet(path, index=False)
-    print(f"Saved {len(df):,} rows → {path}")
+    print(f"Saved {len(df):,} rows -> {path}")
 
 
 def load_processed(path: str = "data/processed/transactions.parquet") -> pd.DataFrame:
