@@ -298,4 +298,4 @@ if __name__ == "__main__":
         print(f"  After dedup merge: {len(df):,} rows")
 
     df.to_csv(out, index=False)
-    print(f"Saved → {out}  ({len(df):,} rows)")
+    print(f"Saved -> {out}  ({len(df):,} rows)")
