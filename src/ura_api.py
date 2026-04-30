@@ -356,16 +356,23 @@ def get_project_rental(
     df = df_rental.copy()
     df["ref_date"] = pd.to_datetime(df["ref_date"], errors="coerce")
 
+    def _safe(v):
+        f = float(v)
+        return None if (f != f) else f  # NaN check (NaN != NaN)
+
     # Try exact project match
     if project_name:
         proj_upper = str(project_name).strip().upper()
         sub = df[df["project_name"].str.strip().str.upper() == proj_upper]
         if len(sub) > 0:
             row = sub.sort_values("ref_date").iloc[-1]
+            median = _safe(row["median_psf_month"])
+            if median is None:
+                return None
             return {
-                "median_psf_month": float(row["median_psf_month"]),
-                "psf25_month":      float(row["psf25_month"]),
-                "psf75_month":      float(row["psf75_month"]),
+                "median_psf_month": median,
+                "psf25_month":      _safe(row["psf25_month"]) or median,
+                "psf75_month":      _safe(row["psf75_month"]) or median,
                 "ref_period":       row["ref_period"],
                 "source":           "project",
             }
@@ -377,10 +384,13 @@ def get_project_rental(
             latest_date = sub["ref_date"].max()
             recent = sub[sub["ref_date"] == latest_date]
             ref_str = recent["ref_period"].iloc[0] if len(recent) > 0 else "?"
+            median = _safe(recent["median_psf_month"].median())
+            if median is None:
+                return None
             return {
-                "median_psf_month": float(recent["median_psf_month"].median()),
-                "psf25_month":      float(recent["psf25_month"].median()),
-                "psf75_month":      float(recent["psf75_month"].median()),
+                "median_psf_month": median,
+                "psf25_month":      _safe(recent["psf25_month"].median()) or median,
+                "psf75_month":      _safe(recent["psf75_month"].median()) or median,
                 "ref_period":       ref_str,
                 "source":           "district",
             }

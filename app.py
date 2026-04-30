@@ -681,7 +681,7 @@ with tab_estimate:
                         district,
                         df_rental,
                     )
-                    if rental:
+                    if rental and rental.get("median_psf_month") is not None:
                         monthly_rent   = rental["median_psf_month"] * area_sqft
                         annual_rent    = monthly_rent * 12
                         p25_rent       = rental["psf25_month"] * area_sqft
