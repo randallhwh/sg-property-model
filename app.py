@@ -698,42 +698,32 @@ with tab_estimate:
                         if listing_price:
                             yield_ask = annual_rent / listing_price * 100
                             ac = "#22c55e" if yield_ask >= 3 else "#fbbf24" if yield_ask >= 2 else "#ef4444"
-                            ask_html = f"""
-                            <div style="border-top:1px solid #1e2d45;margin-top:10px;padding-top:10px;
-                                        display:flex;justify-content:space-between;align-items:center">
-                                <span style="font-size:12px;color:#64748b">Gross yield at asking price</span>
-                                <span style="font-size:18px;font-family:monospace;font-weight:700;
-                                             color:{ac}">{yield_ask:.2f}%&nbsp;<span style="font-size:11px;color:#475569">p.a.</span></span>
-                            </div>"""
+                            ask_html = (
+                                f'<div style="border-top:1px solid #1e2d45;margin-top:10px;padding-top:10px;display:flex;justify-content:space-between;align-items:center">'
+                                f'<div style="font-size:12px;color:#64748b">Gross yield at asking price</div>'
+                                f'<div style="font-size:18px;font-family:monospace;font-weight:700;color:{ac}">{yield_ask:.2f}% <span style="font-size:11px;color:#475569">p.a.</span></div>'
+                                f'</div>'
+                            )
 
-                        st.markdown(f"""
-                        <div style="background:#0a1423;border:1px solid #1e2d45;border-radius:10px;
-                                    padding:16px 20px;margin-top:12px">
-                            <div style="font-size:10px;color:#64748b;text-transform:uppercase;
-                                        letter-spacing:1px;margin-bottom:10px">
-                                Rental Yield Estimate &nbsp;·&nbsp; URA {source_label}
-                            </div>
-                            <div style="display:flex;justify-content:space-between;align-items:center">
-                                <div>
-                                    <div style="font-size:11px;color:#94a3b8">Median monthly rent</div>
-                                    <div style="font-size:20px;font-family:monospace;font-weight:700;
-                                                color:#f1f5f9">${monthly_rent:,.0f}
-                                        <span style="font-size:11px;color:#64748b">/mo</span>
-                                    </div>
-                                    <div style="font-size:11px;color:#475569">
-                                        P25 ${p25_rent:,.0f} &mdash; P75 ${p75_rent:,.0f}
-                                    </div>
-                                </div>
-                                <div style="text-align:right">
-                                    <div style="font-size:11px;color:#94a3b8">Gross yield at fair value</div>
-                                    <div style="font-size:24px;font-family:monospace;font-weight:700;
-                                                color:{yc}">{yield_fv:.2f}%</div>
-                                    <div style="font-size:11px;color:#475569">p.a. gross</div>
-                                </div>
-                            </div>
-                            {ask_html}
-                        </div>
-                        """, unsafe_allow_html=True)
+                        st.markdown(
+                            f'<div style="background:#0a1423;border:1px solid #1e2d45;border-radius:10px;padding:16px 20px;margin-top:12px">'
+                            f'<div style="font-size:10px;color:#64748b;text-transform:uppercase;letter-spacing:1px;margin-bottom:10px">Rental Yield Estimate &nbsp;&middot;&nbsp; URA {source_label}</div>'
+                            f'<div style="display:flex;justify-content:space-between;align-items:center">'
+                            f'<div>'
+                            f'<div style="font-size:11px;color:#94a3b8">Median monthly rent</div>'
+                            f'<div style="font-size:20px;font-family:monospace;font-weight:700;color:#f1f5f9">${monthly_rent:,.0f} <span style="font-size:11px;color:#64748b">/mo</span></div>'
+                            f'<div style="font-size:11px;color:#475569">P25 ${p25_rent:,.0f} &mdash; P75 ${p75_rent:,.0f}</div>'
+                            f'</div>'
+                            f'<div style="text-align:right">'
+                            f'<div style="font-size:11px;color:#94a3b8">Gross yield at fair value</div>'
+                            f'<div style="font-size:24px;font-family:monospace;font-weight:700;color:{yc}">{yield_fv:.2f}%</div>'
+                            f'<div style="font-size:11px;color:#475569">p.a. gross</div>'
+                            f'</div>'
+                            f'</div>'
+                            f'{ask_html}'
+                            f'</div>',
+                            unsafe_allow_html=True
+                        )
 
                 # ── SHAP explanation ──────────────────────────────────────────
                 if res.get("shap_values") is not None:
