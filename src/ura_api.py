@@ -343,11 +343,19 @@ def get_project_rental(
     project_name: str | None,
     district: int | None,
     df_rental: pd.DataFrame,
+    x_svy21: float | None = None,
+    y_svy21: float | None = None,
 ) -> dict | None:
     """
-    Return the most recent rental median for a project, falling back to district average.
+    Return the most recent rental median for a project.
 
-    Returns dict: median_psf_month, psf25_month, psf75_month, ref_period, source
+    Matching priority:
+      1. Exact project name match
+      2. Nearest rental project within 300m (SVY21 coords)
+      3. District average fallback
+
+    Returns dict: median_psf_month, psf25_month, psf75_month, ref_period, source,
+                  matched_project (for nearby), dist_m (for nearby)
     or None if no data available.
     """
     if df_rental is None or len(df_rental) == 0:
@@ -358,42 +366,59 @@ def get_project_rental(
 
     def _safe(v):
         f = float(v)
-        return None if (f != f) else f  # NaN check (NaN != NaN)
+        return None if (f != f) else f  # NaN check
 
-    # Try exact project match
+    def _make_result(row_or_series, source, **extra):
+        median = _safe(row_or_series["median_psf_month"])
+        if median is None:
+            return None
+        return {
+            "median_psf_month": median,
+            "psf25_month":      _safe(row_or_series["psf25_month"]) or median,
+            "psf75_month":      _safe(row_or_series["psf75_month"]) or median,
+            "ref_period":       row_or_series["ref_period"],
+            "source":           source,
+            **extra,
+        }
+
+    # 1. Exact project name match
     if project_name:
         proj_upper = str(project_name).strip().upper()
         sub = df[df["project_name"].str.strip().str.upper() == proj_upper]
         if len(sub) > 0:
             row = sub.sort_values("ref_date").iloc[-1]
-            median = _safe(row["median_psf_month"])
-            if median is None:
-                return None
-            return {
-                "median_psf_month": median,
-                "psf25_month":      _safe(row["psf25_month"]) or median,
-                "psf75_month":      _safe(row["psf75_month"]) or median,
-                "ref_period":       row["ref_period"],
-                "source":           "project",
-            }
+            return _make_result(row, "project")
 
-    # Fallback: district average for the latest available quarter
+    # 2. Coordinate proximity — nearest rental project within 300m
+    if x_svy21 is not None and y_svy21 is not None:
+        rx = pd.to_numeric(df["x_svy21"], errors="coerce")
+        ry = pd.to_numeric(df["y_svy21"], errors="coerce")
+        has_coords = rx.notna() & ry.notna()
+        if has_coords.any():
+            import math
+            dist = ((rx - x_svy21) ** 2 + (ry - y_svy21) ** 2) ** 0.5
+            df["_dist_m"] = dist
+            nearby = df[has_coords & (dist <= 300)].copy()
+            if len(nearby) > 0:
+                # Pick the nearest project's most recent quarter
+                nearest_proj = nearby.sort_values("_dist_m")["project_name"].iloc[0]
+                proj_rows = nearby[nearby["project_name"] == nearest_proj]
+                row = proj_rows.sort_values("ref_date").iloc[-1]
+                dist_m = int(row["_dist_m"])
+                return _make_result(row, "nearby",
+                                    matched_project=nearest_proj,
+                                    dist_m=dist_m)
+
+    # 3. District average for the latest available quarter
     if district is not None:
         sub = df[df["district"].astype(str) == str(district)]
         if len(sub) > 0:
             latest_date = sub["ref_date"].max()
             recent = sub[sub["ref_date"] == latest_date]
             ref_str = recent["ref_period"].iloc[0] if len(recent) > 0 else "?"
-            median = _safe(recent["median_psf_month"].median())
-            if median is None:
-                return None
-            return {
-                "median_psf_month": median,
-                "psf25_month":      _safe(recent["psf25_month"].median()) or median,
-                "psf75_month":      _safe(recent["psf75_month"].median()) or median,
-                "ref_period":       ref_str,
-                "source":           "district",
-            }
+            agg = recent[["median_psf_month", "psf25_month", "psf75_month"]].median()
+            agg["ref_period"] = ref_str
+            return _make_result(agg, "district")
 
     return None
 

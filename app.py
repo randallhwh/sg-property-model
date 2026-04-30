@@ -676,10 +676,14 @@ with tab_estimate:
                 df_rental = load_rental_data()
                 if df_rental is not None:
                     from src.ura_api import get_project_rental
+                    from src.valuation import _resolve_spec_coords
+                    rx, ry = _resolve_spec_coords(spec, fvm.df_history)
                     rental = get_project_rental(
                         project_name.strip().upper() or None,
                         district,
                         df_rental,
+                        x_svy21=rx,
+                        y_svy21=ry,
                     )
                     if rental and rental.get("median_psf_month") is not None:
                         monthly_rent   = rental["median_psf_month"] * area_sqft
@@ -687,11 +691,14 @@ with tab_estimate:
                         p25_rent       = rental["psf25_month"] * area_sqft
                         p75_rent       = rental["psf75_month"] * area_sqft
                         yield_fv       = annual_rent / price_est * 100
-                        source_label   = (
-                            f"project match · {rental['ref_period']}"
-                            if rental["source"] == "project"
-                            else f"D{district:02d} avg · {rental['ref_period']}"
-                        )
+                        if rental["source"] == "project":
+                            source_label = f"project match · {rental['ref_period']}"
+                        elif rental["source"] == "nearby":
+                            matched = rental.get("matched_project", "nearby project")
+                            dist_m  = rental.get("dist_m", 0)
+                            source_label = f"{matched} · {dist_m}m · {rental['ref_period']}"
+                        else:
+                            source_label = f"D{district:02d} avg · {rental['ref_period']}"
                         yc = "#22c55e" if yield_fv >= 3 else "#fbbf24" if yield_fv >= 2 else "#ef4444"
 
                         ask_html = ""
