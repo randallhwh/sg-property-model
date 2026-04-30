@@ -120,6 +120,16 @@ def load_history():
     return pd.read_parquet(DATA_PATH)
 
 
+@st.cache_data(show_spinner=False, ttl=86400)
+def load_rental_data():
+    """Load URA rental median data, fetching from API if not cached today."""
+    try:
+        from src.ura_api import fetch_rental_median
+        return fetch_rental_median()
+    except Exception:
+        return None
+
+
 @st.cache_resource(show_spinner=False)
 def load_model():
     if not os.path.exists(os.path.join(MODEL_DIR, "lgbm_psf_model.joblib")):
@@ -661,6 +671,69 @@ with tab_estimate:
                     &nbsp;·&nbsp; {fmt_sgd(res["ci_low_price"])} — {fmt_sgd(res["ci_high_price"])}
                 </div>
                 """, unsafe_allow_html=True)
+
+                # ── Rental yield ──────────────────────────────────────────────
+                df_rental = load_rental_data()
+                if df_rental is not None:
+                    from src.ura_api import get_project_rental
+                    rental = get_project_rental(
+                        project_name.strip().upper() or None,
+                        district,
+                        df_rental,
+                    )
+                    if rental:
+                        monthly_rent   = rental["median_psf_month"] * area_sqft
+                        annual_rent    = monthly_rent * 12
+                        p25_rent       = rental["psf25_month"] * area_sqft
+                        p75_rent       = rental["psf75_month"] * area_sqft
+                        yield_fv       = annual_rent / price_est * 100
+                        source_label   = (
+                            f"project match · {rental['ref_period']}"
+                            if rental["source"] == "project"
+                            else f"D{district:02d} avg · {rental['ref_period']}"
+                        )
+                        yc = "#22c55e" if yield_fv >= 3 else "#fbbf24" if yield_fv >= 2 else "#ef4444"
+
+                        ask_html = ""
+                        if listing_price:
+                            yield_ask = annual_rent / listing_price * 100
+                            ac = "#22c55e" if yield_ask >= 3 else "#fbbf24" if yield_ask >= 2 else "#ef4444"
+                            ask_html = f"""
+                            <div style="border-top:1px solid #1e2d45;margin-top:10px;padding-top:10px;
+                                        display:flex;justify-content:space-between;align-items:center">
+                                <span style="font-size:12px;color:#64748b">Gross yield at asking price</span>
+                                <span style="font-size:18px;font-family:monospace;font-weight:700;
+                                             color:{ac}">{yield_ask:.2f}%&nbsp;<span style="font-size:11px;color:#475569">p.a.</span></span>
+                            </div>"""
+
+                        st.markdown(f"""
+                        <div style="background:#0a1423;border:1px solid #1e2d45;border-radius:10px;
+                                    padding:16px 20px;margin-top:12px">
+                            <div style="font-size:10px;color:#64748b;text-transform:uppercase;
+                                        letter-spacing:1px;margin-bottom:10px">
+                                Rental Yield Estimate &nbsp;·&nbsp; URA {source_label}
+                            </div>
+                            <div style="display:flex;justify-content:space-between;align-items:center">
+                                <div>
+                                    <div style="font-size:11px;color:#94a3b8">Median monthly rent</div>
+                                    <div style="font-size:20px;font-family:monospace;font-weight:700;
+                                                color:#f1f5f9">${monthly_rent:,.0f}
+                                        <span style="font-size:11px;color:#64748b">/mo</span>
+                                    </div>
+                                    <div style="font-size:11px;color:#475569">
+                                        P25 ${p25_rent:,.0f} &mdash; P75 ${p75_rent:,.0f}
+                                    </div>
+                                </div>
+                                <div style="text-align:right">
+                                    <div style="font-size:11px;color:#94a3b8">Gross yield at fair value</div>
+                                    <div style="font-size:24px;font-family:monospace;font-weight:700;
+                                                color:{yc}">{yield_fv:.2f}%</div>
+                                    <div style="font-size:11px;color:#475569">p.a. gross</div>
+                                </div>
+                            </div>
+                            {ask_html}
+                        </div>
+                        """, unsafe_allow_html=True)
 
                 # ── SHAP explanation ──────────────────────────────────────────
                 if res.get("shap_values") is not None:

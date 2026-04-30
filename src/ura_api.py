@@ -33,7 +33,9 @@ import requests
 
 BASE_URL     = "https://eservice.ura.gov.sg/uraDataService/invokeUraDS/v1"
 TOKEN_URL    = "https://eservice.ura.gov.sg/uraDataService/insertNewToken/v1"
-TOKEN_CACHE  = Path("data/external/ura_token.json")
+TOKEN_CACHE        = Path("data/external/ura_token.json")
+RENTAL_CACHE       = Path("data/external/rental_median.csv")
+RENTAL_CACHE_DATE  = Path("data/external/rental_median_date.txt")
 BATCHES      = [1, 2, 3, 4]
 REQUEST_PAUSE = 1.5   # seconds between batch requests (be polite to the API)
 
@@ -270,6 +272,120 @@ def fetch_all_transactions(access_key: str | None = None) -> pd.DataFrame:
     df = normalise(records)
     print(f"  Normalised: {len(df):,} rows, {df.columns.tolist()}")
     return df
+
+
+# ── Rental median ─────────────────────────────────────────────────────────────
+
+def fetch_rental_median(access_key: str | None = None, force_refresh: bool = False) -> pd.DataFrame:
+    """
+    Fetch per-project quarterly median rental PSF from URA PMI_Resi_Rental_Median.
+
+    Returns a DataFrame with one row per project × quarter:
+      project_name, street, district, ref_period, ref_date,
+      median_psf_month, psf25_month, psf75_month, x_svy21, y_svy21
+
+    Cached to data/external/rental_median.csv for the current day.
+    """
+    if not force_refresh and RENTAL_CACHE.exists() and RENTAL_CACHE_DATE.exists():
+        if RENTAL_CACHE_DATE.read_text().strip() == str(date.today()):
+            return pd.read_csv(RENTAL_CACHE)
+
+    if access_key is None:
+        access_key = _get_access_key()
+
+    print("  Fetching URA rental median data…")
+    session = _make_session(access_key)
+    token   = get_token(access_key, session)
+
+    resp = session.get(
+        BASE_URL,
+        params={"service": "PMI_Resi_Rental_Median", "batch": 1},
+        headers={"Token": token},
+        timeout=60,
+    )
+    resp.raise_for_status()
+    body = resp.json()
+    if body.get("Status") != "Success":
+        raise RuntimeError(f"Rental median fetch failed: {body.get('Message', body)}")
+
+    rows = []
+    for r in body.get("Result") or []:
+        project = r.get("project")
+        for q in (r.get("rentalMedian") or []):
+            ref = q.get("refPeriod", "")
+            try:
+                yr, qn = int(ref[:4]), int(ref[5])
+                ref_date = pd.Timestamp(year=yr, month=(qn - 1) * 3 + 1, day=1)
+            except Exception:
+                ref_date = pd.NaT
+            rows.append({
+                "project_name":     project,
+                "street":           r.get("street"),
+                "district":         q.get("district"),
+                "ref_period":       ref,
+                "ref_date":         ref_date,
+                "median_psf_month": q.get("median"),
+                "psf25_month":      q.get("psf25"),
+                "psf75_month":      q.get("psf75"),
+                "x_svy21":          r.get("x"),
+                "y_svy21":          r.get("y"),
+            })
+
+    df = pd.DataFrame(rows)
+    RENTAL_CACHE.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(RENTAL_CACHE, index=False)
+    RENTAL_CACHE_DATE.write_text(str(date.today()))
+    print(f"  Rental median: {len(df):,} project-quarter rows, {df['project_name'].nunique():,} projects")
+    return df
+
+
+def get_project_rental(
+    project_name: str | None,
+    district: int | None,
+    df_rental: pd.DataFrame,
+) -> dict | None:
+    """
+    Return the most recent rental median for a project, falling back to district average.
+
+    Returns dict: median_psf_month, psf25_month, psf75_month, ref_period, source
+    or None if no data available.
+    """
+    if df_rental is None or len(df_rental) == 0:
+        return None
+
+    df = df_rental.copy()
+    df["ref_date"] = pd.to_datetime(df["ref_date"], errors="coerce")
+
+    # Try exact project match
+    if project_name:
+        proj_upper = str(project_name).strip().upper()
+        sub = df[df["project_name"].str.strip().str.upper() == proj_upper]
+        if len(sub) > 0:
+            row = sub.sort_values("ref_date").iloc[-1]
+            return {
+                "median_psf_month": float(row["median_psf_month"]),
+                "psf25_month":      float(row["psf25_month"]),
+                "psf75_month":      float(row["psf75_month"]),
+                "ref_period":       row["ref_period"],
+                "source":           "project",
+            }
+
+    # Fallback: district average for the latest available quarter
+    if district is not None:
+        sub = df[df["district"].astype(str) == str(district)]
+        if len(sub) > 0:
+            latest_date = sub["ref_date"].max()
+            recent = sub[sub["ref_date"] == latest_date]
+            ref_str = recent["ref_period"].iloc[0] if len(recent) > 0 else "?"
+            return {
+                "median_psf_month": float(recent["median_psf_month"].median()),
+                "psf25_month":      float(recent["psf25_month"].median()),
+                "psf75_month":      float(recent["psf75_month"].median()),
+                "ref_period":       ref_str,
+                "source":           "district",
+            }
+
+    return None
 
 
 # ── CLI entry point ───────────────────────────────────────────────────────────

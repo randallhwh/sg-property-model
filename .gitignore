@@ -5,6 +5,8 @@
 data/raw/
 data/external/geocode_cache.json
 data/external/ura_token.json
+data/external/rental_median.csv
+data/external/rental_median_date.txt
 data/debug_pg.html
 
 # Processed data and model ARE committed so the app works on deployment
