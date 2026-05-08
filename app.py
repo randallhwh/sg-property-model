@@ -272,7 +272,7 @@ def _build_psf_trend_chart(
     project_name: str | None,
     comp_projects: list[str],
     psf_estimate: float,
-    lookback_years: int = 4,
+    lookback_years: int = 5,
 ):
     """
     Line chart of quarterly median PSF for the subject project + up to 4 comp projects.
@@ -827,11 +827,17 @@ with tab_estimate:
                 )
                 if project_name.strip() or comps_for_chart:
                     st.markdown("<br>**PSF price trend**", unsafe_allow_html=True)
+                    _lookback_map = {"2Y": 2, "3Y": 3, "5Y (all)": 5}
+                    _lb_choice = st.radio(
+                        "Lookback period", list(_lookback_map.keys()),
+                        index=2, horizontal=True, label_visibility="collapsed",
+                    )
                     fig_trend = _build_psf_trend_chart(
                         fvm.df_history,
                         project_name.strip().upper() or None,
                         comps_for_chart,
                         psf_est,
+                        lookback_years=_lookback_map[_lb_choice],
                     )
                     st.plotly_chart(fig_trend, width="stretch")
 
@@ -865,7 +871,7 @@ with tab_estimate:
                     Model not trained yet — showing comparable transactions only.
                 </div>
                 """, unsafe_allow_html=True)
-                from src.valuation import get_comps, get_project_history, SPEC_DEFAULTS
+                from src.valuation import get_comps, get_project_history
                 proj_hist = get_project_history(spec, df_hist, n=15)
                 comps = get_comps(spec, df_hist, n=15)
                 if len(proj_hist) > 0:
