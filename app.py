@@ -267,6 +267,89 @@ def _render_comps(comps: pd.DataFrame):
     st.markdown(table, unsafe_allow_html=True)
 
 
+def _build_psf_trend_chart(
+    df_history: pd.DataFrame,
+    project_name: str | None,
+    comp_projects: list[str],
+    psf_estimate: float,
+    lookback_years: int = 4,
+):
+    """
+    Line chart of quarterly median PSF for the subject project + up to 4 comp projects.
+    psf_estimate is shown as a horizontal dashed gold line.
+    """
+    from datetime import date
+    cutoff = pd.Timestamp(date.today()) - pd.DateOffset(years=lookback_years)
+    df = df_history[df_history["date_of_sale"] >= cutoff].copy()
+    df["quarter"] = df["date_of_sale"].dt.to_period("Q").dt.to_timestamp()
+
+    fig = go.Figure()
+
+    # Subject project — prominent blue line
+    if project_name:
+        proj_upper = project_name.strip().upper()
+        sub = df[df["project_name"].str.upper() == proj_upper]
+        if len(sub) > 0:
+            trend = sub.groupby("quarter")["psf"].median().reset_index()
+            trend = trend.sort_values("quarter")
+            fig.add_trace(go.Scatter(
+                x=trend["quarter"], y=trend["psf"],
+                mode="lines+markers",
+                name=project_name.title(),
+                line=dict(color="#60a5fa", width=3),
+                marker=dict(size=6, color="#60a5fa"),
+                hovertemplate="%{x|%b %Y}<br>PSF: $%{y:,.0f}<extra>" + project_name.title() + "</extra>",
+            ))
+
+    # Comp projects — muted colours, thinner lines (max 4)
+    comp_colors = ["#a78bfa", "#34d399", "#fb923c", "#f472b6"]
+    for i, comp in enumerate(comp_projects[:4]):
+        sub = df[df["project_name"].str.upper() == comp.strip().upper()]
+        if len(sub) < 3:
+            continue
+        trend = sub.groupby("quarter")["psf"].median().reset_index()
+        trend = trend.sort_values("quarter")
+        fig.add_trace(go.Scatter(
+            x=trend["quarter"], y=trend["psf"],
+            mode="lines",
+            name=comp.title(),
+            line=dict(color=comp_colors[i % len(comp_colors)], width=1.5, dash="dot"),
+            hovertemplate="%{x|%b %Y}<br>PSF: $%{y:,.0f}<extra>" + comp.title() + "</extra>",
+            opacity=0.75,
+        ))
+
+    # Fair value estimate — gold dashed horizontal
+    fig.add_hline(
+        y=psf_estimate,
+        line=dict(color="#fbbf24", width=1.5, dash="dash"),
+        annotation_text=f"  Est. ${psf_estimate:,.0f}",
+        annotation_font=dict(color="#fbbf24", size=11),
+        annotation_position="right",
+    )
+
+    fig.update_layout(
+        paper_bgcolor="#060c18", plot_bgcolor="#0a1120",
+        height=300,
+        margin=dict(l=10, r=80, t=20, b=30),
+        legend=dict(
+            bgcolor="#0d1a2d", bordercolor="#1e2d45", borderwidth=1,
+            font=dict(color="#e2e8f0", size=11),
+            orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0,
+        ),
+        xaxis=dict(
+            gridcolor="#0f1e35", tickfont=dict(color="#94a3b8"),
+            tickformat="%b %Y",
+        ),
+        yaxis=dict(
+            gridcolor="#0f1e35", tickfont=dict(color="#94a3b8"),
+            tickprefix="$", tickformat=",.0f",
+        ),
+        font=dict(color="#cbd5e1"),
+        hovermode="x unified",
+    )
+    return fig
+
+
 def _build_district_bar(df: pd.DataFrame):
     """Median PSF by postal district, coloured by market segment."""
     seg_colors = {"CCR": "#22c55e", "RCR": "#60a5fa", "OCR": "#a78bfa"}
@@ -736,6 +819,21 @@ with tab_estimate:
                 if res.get("shap_values") is not None:
                     st.markdown("<br>**Value drivers (SHAP)**", unsafe_allow_html=True)
                     _render_shap(res["shap_values"])
+
+                # ── PSF trend chart ───────────────────────────────────────────
+                comps_for_chart = (
+                    res["comps"]["Project"].tolist()
+                    if len(res["comps"]) > 0 else []
+                )
+                if project_name.strip() or comps_for_chart:
+                    st.markdown("<br>**PSF price trend**", unsafe_allow_html=True)
+                    fig_trend = _build_psf_trend_chart(
+                        fvm.df_history,
+                        project_name.strip().upper() or None,
+                        comps_for_chart,
+                        psf_est,
+                    )
+                    st.plotly_chart(fig_trend, width="stretch")
 
                 # ── Project history ───────────────────────────────────────────
                 proj_hist = res.get("project_history", pd.DataFrame())
