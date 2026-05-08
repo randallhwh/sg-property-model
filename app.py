@@ -350,6 +350,113 @@ def _build_psf_trend_chart(
     return fig
 
 
+def _make_snapshot_figure(
+    spec: dict,
+    res: dict,
+    rental: dict | None,
+    psf_est: float,
+    price_est: float,
+    area_sqft: float,
+    district: int,
+    df_history,
+    comps_for_chart: list[str],
+    lookback_years: int = 5,
+) -> "go.Figure":
+    """Composite 900×620 PNG: header + key metrics + PSF trend chart."""
+    from plotly.subplots import make_subplots
+    from datetime import date as _date
+
+    fig = make_subplots(
+        rows=2, cols=1,
+        row_heights=[0.35, 0.65],
+        vertical_spacing=0.04,
+    )
+
+    # ── Trend chart (row 2) ────────────────────────────────────────────────
+    trend_fig = _build_psf_trend_chart(
+        df_history, spec.get("project_name"), comps_for_chart, psf_est, lookback_years
+    )
+    for trace in trend_fig.data:
+        fig.add_trace(trace, row=2, col=1)
+    fig.add_hline(
+        y=psf_est, line=dict(color="#fbbf24", width=1.5, dash="dash"),
+        annotation_text=f"  Est. ${psf_est:,.0f}",
+        annotation_font=dict(color="#fbbf24", size=11),
+        row=2, col=1,
+    )
+
+    # ── Header text ───────────────────────────────────────────────────────
+    proj = (spec.get("project_name") or f"D{district:02d} Property").title()
+    tenure_short = spec.get("tenure_raw", "").split(" ")[0]
+    prop_lbl = TYPE_LABEL.get(spec.get("property_type", "condo"), "")
+    subtitle = (
+        f"D{district:02d} · {int(area_sqft):,} sqft · {prop_lbl} · "
+        f"{tenure_short} · {_date.today().strftime('%d %b %Y')}"
+    )
+    fig.add_annotation(x=0.01, y=0.99, xref="paper", yref="paper",
+                       text=f"<b>{proj}</b>", showarrow=False,
+                       font=dict(size=17, color="#f1f5f9"), xanchor="left", yanchor="top")
+    fig.add_annotation(x=0.01, y=0.965, xref="paper", yref="paper",
+                       text=subtitle, showarrow=False,
+                       font=dict(size=11, color="#94a3b8"), xanchor="left", yanchor="top")
+
+    # ── Metric row ────────────────────────────────────────────────────────
+    ci_lo  = res.get("ci_low_psf",  psf_est * 0.85)
+    ci_hi  = res.get("ci_high_psf", psf_est * 1.15)
+    pct_d  = res.get("pct_vs_district", 0)
+    sign   = "+" if pct_d >= 0 else ""
+    pc     = "#22c55e" if pct_d > 5 else "#86efac" if pct_d > 0 else "#f87171" if pct_d > -5 else "#ef4444"
+
+    metrics = [
+        ("FAIR VALUE PSF",         f"${psf_est:,.0f}",  "#60a5fa"),
+        ("FAIR VALUE PRICE",       f"${price_est:,.0f}", "#fbbf24"),
+        (f"VS D{district:02d} MEDIAN", f"{sign}{pct_d:.1f}%", pc),
+    ]
+    if rental and rental.get("median_psf_month"):
+        annual = rental["median_psf_month"] * area_sqft * 12
+        yld    = annual / price_est * 100
+        yc     = "#22c55e" if yld >= 3 else "#fbbf24" if yld >= 2 else "#ef4444"
+        metrics.append(("GROSS YIELD (FV)", f"{yld:.2f}%", yc))
+
+    n = len(metrics)
+    for i, (lbl, val, col) in enumerate(metrics):
+        xp = (i + 0.5) / n
+        fig.add_annotation(x=xp, y=0.925, xref="paper", yref="paper",
+                           text=lbl, showarrow=False,
+                           font=dict(size=9, color="#64748b"), xanchor="center")
+        fig.add_annotation(x=xp, y=0.87, xref="paper", yref="paper",
+                           text=f"<b>{val}</b>", showarrow=False,
+                           font=dict(size=16, color=col, family="monospace"), xanchor="center")
+
+    # CI as a single sub-line below the metrics row
+    fig.add_annotation(x=0.5, y=0.805, xref="paper", yref="paper",
+                       text=f"80% confidence interval: ${ci_lo:,.0f} – ${ci_hi:,.0f} psf",
+                       showarrow=False, font=dict(size=9, color="#475569"), xanchor="center")
+
+    fig.add_shape(type="line", xref="paper", yref="paper",
+                  x0=0, x1=1, y0=0.775, y1=0.775,
+                  line=dict(color="#1e2d45", width=1))
+
+    # Footer
+    fig.add_annotation(x=0.5, y=0.005, xref="paper", yref="paper",
+                       text="SG Property Fair Value · URA data + LightGBM",
+                       showarrow=False, font=dict(size=8, color="#334155"), xanchor="center")
+
+    fig.update_layout(
+        paper_bgcolor="#060c18", plot_bgcolor="#0a1120",
+        width=960, height=620,
+        margin=dict(l=75, r=110, t=15, b=30),
+        font=dict(color="#cbd5e1"),
+        legend=dict(bgcolor="rgba(13,26,45,0.8)", bordercolor="#1e2d45", borderwidth=1,
+                    font=dict(color="#e2e8f0", size=10),
+                    orientation="h", yanchor="top", y=0.62, xanchor="left", x=0),
+        xaxis2=dict(gridcolor="#0f1e35", tickfont=dict(color="#94a3b8"), tickformat="%b %Y"),
+        yaxis2=dict(gridcolor="#0f1e35", tickfont=dict(color="#94a3b8"),
+                    tickprefix="$", tickformat=",.0f"),
+    )
+    return fig
+
+
 def _build_district_bar(df: pd.DataFrame):
     """Median PSF by postal district, coloured by market segment."""
     seg_colors = {"CCR": "#22c55e", "RCR": "#60a5fa", "OCR": "#a78bfa"}
@@ -863,6 +970,29 @@ with tab_estimate:
                     _render_comps(comps)
                 else:
                     st.info("No comparable transactions found in dataset.")
+
+                # ── Download snapshot ─────────────────────────────────────────
+                st.markdown("<br>", unsafe_allow_html=True)
+                try:
+                    import plotly.io as pio
+                    _snap_rental = rental if "rental" in dir() else None
+                    fig_snap = _make_snapshot_figure(
+                        spec, res, _snap_rental,
+                        psf_est, price_est, area_sqft, district,
+                        fvm.df_history, comps_for_chart,
+                        lookback_years=_lookback_map.get(_lb_choice, 5),
+                    )
+                    _snap_bytes = pio.to_image(fig_snap, format="png", scale=2)
+                    _fname = f"sg_property_{(project_name.strip() or f'D{district:02d}').replace(' ','_')}_{pd.Timestamp.today().strftime('%Y%m%d')}.png"
+                    st.download_button(
+                        "📸 Download results as PNG",
+                        data=_snap_bytes,
+                        file_name=_fname,
+                        mime="image/png",
+                        use_container_width=True,
+                    )
+                except Exception:
+                    pass
 
             # ── Comps-only fallback (data but no model) ───────────────────────
             else:
